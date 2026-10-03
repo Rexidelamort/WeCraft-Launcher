@@ -305,6 +305,50 @@ def set_profile(base_dir, name, version_id, game_dir, ram):
         f.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
+# Processus du launcher officiel (version classique / version Microsoft Store)
+OFFICIAL_LAUNCHER_PROCESSES = ("MinecraftLauncher.exe", "Minecraft.exe")
+
+
+def _run_quiet(cmd):
+    """Commande sans fenêtre. stdin=DEVNULL est indispensable dans un .exe « windowed »,
+    sinon Windows renvoie « handle invalide » et la commande ne part jamais."""
+    return subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="ignore",
+                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+def _win_running(name):
+    return name.lower() in _run_quiet(["tasklist", "/FI", f"IMAGENAME eq {name}", "/NH"]).stdout.lower()
+
+
+def close_official_launcher(timeout=8):
+    """Ferme le launcher officiel (sans toucher à une partie en cours : seul le processus du
+    launcher est arrêté). Renvoie (réussi, message)."""
+    try:
+        if sys.platform.startswith("win"):
+            running = [n for n in OFFICIAL_LAUNCHER_PROCESSES if _win_running(n)]
+            if not running:
+                return True, "Launcher officiel déjà fermé."
+            for n in running:
+                _run_quiet(["taskkill", "/F", "/IM", n])
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if not any(_win_running(n) for n in running):
+                    time.sleep(1.5)  # laisse Windows libérer les fichiers
+                    return True, "Launcher officiel fermé."
+                time.sleep(0.5)
+            return False, "Le launcher officiel ne se ferme pas : fermez-le à la main."
+        if sys.platform == "darwin":
+            _run_quiet(["osascript", "-e", 'tell application "Minecraft" to quit'])
+        else:
+            for cmd in (["pkill", "-x", "minecraft-launcher"], ["flatpak", "kill", "com.mojang.Minecraft"]):
+                if shutil.which(cmd[0]):
+                    _run_quiet(cmd)
+        time.sleep(1.5)
+        return True, "Launcher officiel fermé."
+    except Exception as e:
+        return False, f"Impossible de fermer le launcher officiel ({e}) : fermez-le à la main."
+
+
 def open_official_launcher():
     """Ouvre le launcher officiel (version Microsoft Store ou classique). False si échec."""
     try:
@@ -1204,6 +1248,12 @@ class Launcher(tk.Tk):
                     loader_version=None, force=False, profile=PROFILE_NAME):
         try:
             Path(game_dir).mkdir(parents=True, exist_ok=True)
+            # 1) Priorité : fermer le launcher officiel (il réécrirait sinon ses profils)
+            self.set_status("Fermeture du launcher officiel...")
+            closed, msg = close_official_launcher()
+            self.set_status(msg)
+            if not closed:
+                self.after(0, lambda: messagebox.showwarning("Launcher officiel", msg))
             callback = {
                 "setStatus": self.set_status,
                 "setProgress": lambda v: self.set_progress(v),
