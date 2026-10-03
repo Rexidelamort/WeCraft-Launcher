@@ -27,7 +27,7 @@ jobs:
       - name: Compilation de l'exe
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force fonts | Out-Null
+          New-Item -ItemType File -Force fonts/.keep | Out-Null
           pyinstaller --onefile --windowed --name WeCraft --add-data "assets;assets" --add-data "fonts;fonts" wecraft_launcher.py
 
       - name: Empreinte SHA-256
