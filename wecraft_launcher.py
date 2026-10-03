@@ -490,7 +490,7 @@ def _http(url, timeout=10):
 
 def fetch_latest_release():
     """Dernière release publiée sur GitHub : version, notes, .exe et son empreinte SHA-256."""
-    with _http(f"https://api.github.com/repos/Rexidelamort/WeCraft-Launcher/releases/latest") as r:
+    with _http(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest") as r:
         d = json.load(r)
     assets = d.get("assets", [])
     exe = next((a for a in assets if a["name"].lower().endswith(".exe")), None)
@@ -820,13 +820,19 @@ class Launcher(tk.Tk):
                bordercolor=[("active", EMBER1)],
                foreground=[("pressed", "#1A0A04"), ("disabled", MUTED)])
 
-        st.configure("Bar.TCheckbutton", background=BG, foreground=MUTED, indicatorcolor=FIELD,
-                     indicatorbackground=FIELD, font=(mono, 8))
-        st.map("Bar.TCheckbutton", background=[("active", BG)], indicatorcolor=[("selected", EMBER1)],
-               foreground=[("active", FG)])
-        st.configure("Card.TCheckbutton", background=PANEL, foreground=FG, indicatorcolor=FIELD,
-                     indicatorbackground=FIELD, font=(body, 10))
-        st.map("Card.TCheckbutton", background=[("active", PANEL)], indicatorcolor=[("selected", EMBER1)])
+        # Cases à cocher : sur le thème « clam » la coche est noire par défaut, donc invisible sur
+        # fond sombre. « indicatorforeground » donne sa couleur à la coche (braise).
+        for name, bg, fg, size in (("Bar.TCheckbutton", BG, MUTED, 8), ("Card.TCheckbutton", PANEL, FG, 10)):
+            st.configure(name, background=bg, foreground=fg, font=(mono if size == 8 else body, size),
+                         indicatorbackground=FIELD, indicatorforeground=EMBER2,
+                         upperbordercolor=BORDER, lowerbordercolor=BORDER, indicatormargin=(1, 1, 6, 1))
+            st.map(name,
+                   background=[("active", bg)],
+                   foreground=[("active", FG)],
+                   indicatorbackground=[("disabled", BORDER), ("pressed", "#161D36"), ("!disabled", FIELD)],
+                   indicatorforeground=[("disabled", MUTED), ("!disabled", EMBER2)],
+                   upperbordercolor=[("selected", EMBER1), ("!selected", BORDER)],
+                   lowerbordercolor=[("selected", EMBER1), ("!selected", BORDER)])
         st.configure("TCombobox", fieldbackground=FIELD, background="#161D36", foreground=FG,
                      arrowcolor=EMBER2, bordercolor=BORDER, selectbackground=FIELD,
                      selectforeground=FG, padding=5)
