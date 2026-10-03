@@ -17,10 +17,12 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import uuid
 import threading
+import urllib.error
 import urllib.request
 import time
 import tkinter as tk
@@ -52,7 +54,7 @@ RES_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))  # assets/ et fonts/ intégré
 
 # Mises à jour automatiques via les « Releases » GitHub (dépôt PUBLIC)
 APP_VERSION = "1.0.0"  # mis à jour automatiquement par le workflow GitHub à chaque release
-GITHUB_REPO = "TON-PSEUDO/WeCraft-Launcher"  # <-- À MODIFIER : « pseudo/nom-du-depot »
+GITHUB_REPO = "TON-PSEUDO/WeCraft-Launcher"  # rempli automatiquement par le workflow GitHub
 
 # Charte WeCraft : noir spatial, blanc chaud, dégradé braise, bleu étoilé
 BG, PANEL, FG = "#05060C", "#0F1424", "#EEECE4"
@@ -193,7 +195,7 @@ def read_local_instance(folder):
     """Instance déposée dans « instances/ » : version et loader lus dans les fichiers présents
     (CurseForge, Prism, export CurseForge, export Modrinth) ou dans « wecraft.json » (prioritaire)."""
     inst = {"name": folder.name, "folder": folder, "path": folder, "version": None,
-            "loader": None, "loader_version": None, "ram": None}
+            "loader": None, "loader_version": None, "ram": None, "source": "WeCraft"}
     try:
         if (folder / "mmc-pack.json").exists():  # Prism : le jeu est dans le sous-dossier minecraft
             _, mc, loader, lv = read_prism(folder)
@@ -251,6 +253,105 @@ def scan_instances():
     except Exception:
         return []
     return [read_local_instance(f) for f in folders]
+
+
+
+# ---- Toutes les instances (dossier WeCraft + CurseForge / Modrinth / Prism) et réglages perso
+META_FILE = Path(MC_DIR) / "instances_meta.json"  # nom affiché, masquée, version/loader/RAM forcés
+SOURCE_ORDER = {"WeCraft": 0, "CurseForge": 1, "Modrinth": 2, "Prism": 3}
+SOURCE_LABEL = {"WeCraft": "WECRAFT", "CurseForge": "CURSEFORGE", "Modrinth": "MODRINTH", "Prism": "PRISM"}
+
+
+def meta_key(folder):
+    return os.path.normcase(str(folder))
+
+
+def load_meta():
+    try:
+        data = json.loads(META_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def update_meta(folder, set=None, remove=()):
+    """Enregistre des réglages pour une instance sans jamais modifier son dossier."""
+    meta = load_meta()
+    entry = meta.setdefault(meta_key(folder), {})
+    entry.update(set or {})
+    for k in remove:
+        entry.pop(k, None)
+    if not entry:
+        meta.pop(meta_key(folder), None)
+    META_FILE.parent.mkdir(parents=True, exist_ok=True)
+    META_FILE.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def forget_meta(folder):
+    meta = load_meta()
+    if meta.pop(meta_key(folder), None) is not None:
+        META_FILE.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def detect_external():
+    """Instances CurseForge, Modrinth et Prism trouvées sur le PC."""
+    out = []
+    try:
+        found = detect_instances()
+    except Exception:
+        return out
+    for d in found:
+        if d["source"] not in SOURCE_ORDER:
+            continue  # le « .minecraft » officiel n'est pas listé ici
+        path = Path(d["path"])
+        out.append({"name": d["name"], "folder": path.parent if d["source"] == "Prism" else path,
+                    "path": path, "version": d["version"], "loader": d["loader"],
+                    "loader_version": d["loader_version"], "ram": None, "source": d["source"]})
+    return out
+
+
+def apply_meta(instances):
+    """Applique nom affiché, masquage et réglages forcés (fichier instances_meta.json)."""
+    meta = load_meta()
+    for i in instances:
+        m = meta.get(meta_key(i["folder"]), {})
+        if m.get("version"):
+            i["version"] = str(m["version"])
+        if "loader" in m:
+            i["loader"] = m["loader"]
+        if "loader_version" in m:
+            i["loader_version"] = m["loader_version"] or None
+        if m.get("ram"):
+            i["ram"] = int(m["ram"])
+        if i["loader"] not in LOADERS or i["loader"] == "Vanilla":
+            i["loader"] = None
+        if not i["loader"]:
+            i["loader_version"] = None
+        i["display"] = (m.get("name") or "").strip() or i["name"]
+        i["hidden"] = bool(m.get("hidden"))
+    return instances
+
+
+def safe_to_delete(folder):
+    """Garde-fou : on ne supprime qu'un vrai dossier d'instance, jamais un dossier système."""
+    try:
+        p = Path(folder).resolve()
+        home = Path.home().resolve()
+        protected = {home, Path(MC_DIR).resolve(), INSTANCES_DIR.resolve(), Path(SYSTEM_MC_DIR).resolve()}
+        return (p.is_dir() and len(p.parts) >= 4
+                and not any(q == p or p in q.parents for q in protected | {home}))
+    except Exception:
+        return False
+
+
+def remove_tree(folder):
+    def fix(func, path, _exc):  # fichiers en lecture seule (Windows)
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+    try:
+        shutil.rmtree(folder, onexc=fix)
+    except TypeError:  # Python < 3.12
+        shutil.rmtree(folder, onerror=fix)
 
 
 PROFILE_NAME = "WECRAFT"
@@ -389,7 +490,7 @@ def _http(url, timeout=10):
 
 def fetch_latest_release():
     """Dernière release publiée sur GitHub : version, notes, .exe et son empreinte SHA-256."""
-    with _http(f"https://api.github.com/repos/Rexidelamort/WeCraft-Launcher/releases/latest") as r:
+    with _http(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest") as r:
         d = json.load(r)
     assets = d.get("assets", [])
     exe = next((a for a in assets if a["name"].lower().endswith(".exe")), None)
@@ -406,6 +507,17 @@ def fetch_latest_release():
     return {"version": d["tag_name"].lstrip("vV"), "notes": (d.get("body") or "").strip(),
             "page": d["html_url"], "url": exe["browser_download_url"] if exe else None,
             "size": exe["size"] if exe else 0, "sha256": sha}
+
+
+def explain_update_error(e):
+    if isinstance(e, urllib.error.HTTPError):
+        if e.code == 404:
+            return (f"Aucune release trouvée sur « {GITHUB_REPO} ».\nVérifiez que le dépôt est public, "
+                    "que ce nom est exact et qu'une release est publiée (pas en brouillon).")
+        if e.code in (403, 429):
+            return "Limite de requêtes GitHub atteinte, réessayez dans une heure."
+        return f"Erreur GitHub {e.code}."
+    return f"Connexion impossible ({e})."
 
 
 def download_update(info, dest, progress=lambda done, total: None):
@@ -552,6 +664,7 @@ class Launcher(tk.Tk):
         self.busy = False
         self.card_buttons = []
         self._inst_sig = None
+        self._instances, self._ext, self._ext_time = [], None, 0.0
         self.build_ui()
         self.load_versions()
         self.check_updates()
@@ -559,14 +672,26 @@ class Launcher(tk.Tk):
         self.after(3000, self.poll_instances)
 
     # ---------- Mises à jour ----------
-    def check_updates(self):
+    def check_updates(self, manual=False):
+        """Au démarrage : silencieux. Via le lien en bas de fenêtre (manual) : dit toujours ce qui se passe."""
         def worker():
             try:
                 info = fetch_latest_release()
-            except Exception:
-                return  # hors ligne, pas de release, dépôt privé... : on ignore en silence
+            except Exception as e:
+                try:  # trace dans %APPDATA%/.wecraft/update.log
+                    with open(Path(MC_DIR) / "update.log", "a", encoding="utf-8") as f:
+                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {GITHUB_REPO}  {e!r}\n")
+                except Exception:
+                    pass
+                if manual:
+                    msg = explain_update_error(e)
+                    self.after(0, lambda: messagebox.showwarning("Mises à jour", msg))
+                return
             if version_tuple(info["version"]) > version_tuple(APP_VERSION):
                 self.after(0, lambda: self.show_update(info))
+            elif manual:
+                self.after(0, lambda: messagebox.showinfo(
+                    "Mises à jour", f"WeCraft est à jour (v{APP_VERSION}). Dernière version publiée : v{info['version']}."))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -614,9 +739,11 @@ class Launcher(tk.Tk):
                     self.after(0, lambda: state.config(text="Redémarrage..."))
                     apply_update(dest)
                     self.after(500, self.destroy)
-                except Exception as e:
+                except Exception as exc:
+                    err = str(exc)  # « exc » disparaît à la fin du bloc except : on garde le texte
+
                     def fail():
-                        messagebox.showerror("Mise à jour", f"Échec de la mise à jour :\n{e}", parent=win)
+                        messagebox.showerror("Mise à jour", f"Échec de la mise à jour :\n{err}", parent=win)
                         btn.config(state="normal")
                         later.state(["!disabled"])
                     self.after(0, fail)
@@ -693,6 +820,10 @@ class Launcher(tk.Tk):
                bordercolor=[("active", EMBER1)],
                foreground=[("pressed", "#1A0A04"), ("disabled", MUTED)])
 
+        st.configure("Bar.TCheckbutton", background=BG, foreground=MUTED, indicatorcolor=FIELD,
+                     indicatorbackground=FIELD, font=(mono, 8))
+        st.map("Bar.TCheckbutton", background=[("active", BG)], indicatorcolor=[("selected", EMBER1)],
+               foreground=[("active", FG)])
         st.configure("Card.TCheckbutton", background=PANEL, foreground=FG, indicatorcolor=FIELD,
                      indicatorbackground=FIELD, font=(body, 10))
         st.map("Card.TCheckbutton", background=[("active", PANEL)], indicatorcolor=[("selected", EMBER1)])
@@ -766,7 +897,12 @@ class Launcher(tk.Tk):
             self.tab_labels[key] = lbl
 
         # Bas de fenêtre (packé avant le contenu pour rester toujours visible)
-        tk.Label(self, text=f"v{APP_VERSION}", bg=BG, fg=MUTED, font=(self.f_mono, 8)).pack(side="bottom", pady=(4, 8))
+        ver = tk.Label(self, text=f"v{APP_VERSION}  ·  rechercher une mise à jour", bg=BG, fg=MUTED,
+                       cursor="hand2", font=(self.f_mono, 8))
+        ver.pack(side="bottom", pady=(4, 8))
+        ver.bind("<Button-1>", lambda e: self.check_updates(manual=True))
+        ver.bind("<Enter>", lambda e: ver.config(fg=EMBER2))
+        ver.bind("<Leave>", lambda e: ver.config(fg=MUTED))
         tk.Label(self, text="Fermez le launcher officiel avant de cliquer.", bg=BG, fg=MUTED,
                  font=(self.f_mono, 8)).pack(side="bottom")
         self.progress = ttk.Progressbar(self, mode="determinate", style="Ember.Horizontal.TProgressbar")
@@ -807,10 +943,14 @@ class Launcher(tk.Tk):
 
         bar = tk.Frame(self.instances_frame, bg=BG)
         bar.pack(fill="x", padx=14, pady=(6, 0))
-        ttk.Button(bar, text="Ouvrir le dossier « instances »", command=self.open_instances_dir).pack(side="left")
-        ttk.Button(bar, text="Actualiser", command=lambda: self.refresh_instances(force=True)).pack(side="left", padx=6)
-        tk.Label(self.instances_frame, text="Déposez un dossier d'instance dans « instances » : "
-                 "un bouton LANCER apparaît.", bg=BG, fg=MUTED, font=(self.f_mono, 8)).pack(pady=(6, 0))
+        ttk.Button(bar, text="Dossier instances", command=self.open_instances_dir).pack(side="left")
+        ttk.Button(bar, text="Actualiser",
+                   command=lambda: self.refresh_instances(force=True, rescan=True)).pack(side="left", padx=6)
+        self.show_hidden = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bar, text="Voir les masquées", variable=self.show_hidden, style="Bar.TCheckbutton",
+                        command=lambda: self.refresh_instances(force=True)).pack(side="right")
+        tk.Label(self.instances_frame, text="CurseForge, Modrinth et Prism sont détectés automatiquement.",
+                 bg=BG, fg=MUTED, font=(self.f_mono, 8)).pack(pady=(6, 0))
 
         # ---------- Onglet « Manuel » ----------
         m = self.manual_frame
@@ -865,7 +1005,7 @@ class Launcher(tk.Tk):
         self.tab = None
         self.show_tab("instances")
 
-    # ---------- Onglets et instances déposées ----------
+    # ---------- Onglets et instances ----------
     def show_tab(self, tab):
         self.tab = tab
         for frame in (self.instances_frame, self.manual_frame):
@@ -883,23 +1023,35 @@ class Launcher(tk.Tk):
         self.refresh_instances()
         self.after(3000, self.poll_instances)
 
-    def refresh_instances(self, force=False):
-        """Relit « instances/ » : un bouton LANCER apparaît (ou disparaît) pour chaque dossier."""
-        insts = scan_instances()
-        sig = [(i["name"], str(i["path"]), i["version"], i["loader"], i["loader_version"], i["ram"])
-               for i in insts]
+    def refresh_instances(self, force=False, rescan=False):
+        """Relit « instances/ » toutes les 3 s ; CurseForge / Modrinth / Prism toutes les 30 s
+        (ou via « Actualiser »). Un bouton LANCER apparaît pour chaque instance trouvée."""
+        if rescan or self._ext is None or time.monotonic() - self._ext_time > 30:
+            self._ext, self._ext_time = detect_external(), time.monotonic()
+        insts = apply_meta(scan_instances() + self._ext)
+        insts.sort(key=lambda i: (SOURCE_ORDER.get(i["source"], 9), i["display"].lower()))
+        self._instances = insts
+        shown = [i for i in insts if self.show_hidden.get() or not i["hidden"]]
+        sig = [(i["display"], i["hidden"], i["source"], str(i["path"]), i["version"], i["loader"],
+                i["loader_version"], i["ram"]) for i in shown]
         if force or sig != self._inst_sig:
             self._inst_sig = sig
-            self.render_instances(insts)
+            self.render_instances(shown, hidden_count=len(insts) - len(shown))
 
-    def render_instances(self, insts):
+    def find_instance(self, folder):
+        return next((i for i in self._instances if meta_key(i["folder"]) == meta_key(folder)), None)
+
+    def render_instances(self, insts, hidden_count=0):
         for w in self.cards.winfo_children():
             w.destroy()
         self.card_buttons = []
         if not insts:
-            tk.Label(self.cards, text="Aucune instance pour le moment.\n\nCopiez un dossier d'instance dans le "
-                     "dossier « instances »\n(bouton ci-dessous) : il apparaît ici tout seul.",
-                     bg=BG, fg=MUTED, font=(self.f_body, 10), justify="center").pack(pady=40)
+            text = ("Toutes vos instances sont masquées.\nCochez « Voir les masquées » pour les afficher."
+                    if hidden_count else
+                    "Aucune instance pour le moment.\n\nCréez-en une dans CurseForge, Modrinth ou Prism,\n"
+                    "ou copiez un dossier dans « Dossier instances » :\nelle apparaît ici toute seule.")
+            tk.Label(self.cards, text=text, bg=BG, fg=MUTED, font=(self.f_body, 10),
+                     justify="center").pack(pady=40)
             return
         for inst in insts:
             self.build_card(inst)
@@ -907,8 +1059,9 @@ class Launcher(tk.Tk):
     def build_card(self, inst):
         card = tk.Frame(self.cards, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
         card.pack(fill="x", padx=(0, 6), pady=4)
-        ttk.Button(card, text="⚙", width=3, command=lambda i=inst: self.configure_instance(i)).pack(
-            side="right", padx=(0, 10))
+        gear = ttk.Button(card, text="⚙", width=3)
+        gear.config(command=lambda i=inst, w=gear: self.show_menu(i, w))
+        gear.pack(side="right", padx=(0, 10))
         known = bool(inst["version"])
         btn = GradientButton(card, text="LANCER" if known else "RÉGLER", bg=PANEL, width=112, height=38,
                              font=(self.f_display, 9, "bold"),
@@ -918,12 +1071,110 @@ class Launcher(tk.Tk):
         self.card_buttons.append(btn)
         left = tk.Frame(card, bg=PANEL)
         left.pack(side="left", fill="x", expand=True, padx=12, pady=10)
-        tk.Label(left, text=inst["name"], bg=PANEL, fg=FG, anchor="w",
+        title = inst["display"] + ("  (masquée)" if inst["hidden"] else "")
+        tk.Label(left, text=title, bg=PANEL, fg=MUTED if inst["hidden"] else FG, anchor="w",
                  font=(self.f_display, 11, "bold")).pack(fill="x")
         detail = " · ".join(x for x in (inst["version"], inst["loader"], inst["loader_version"],
                                         f"{inst['ram']} Go" if inst["ram"] else None) if x)
-        tk.Label(left, text=detail or "version inconnue : cliquez sur RÉGLER", bg=PANEL, anchor="w",
-                 fg=BLUE if detail else EMBER2, font=(self.f_mono, 8)).pack(fill="x")
+        tag = SOURCE_LABEL.get(inst["source"], inst["source"].upper())
+        tk.Label(left, text=f"{tag}  ·  {detail or 'version inconnue : cliquez sur RÉGLER'}", bg=PANEL,
+                 anchor="w", fg=MUTED if inst["hidden"] else (BLUE if detail else EMBER2),
+                 font=(self.f_mono, 8)).pack(fill="x")
+
+    def show_menu(self, inst, widget):
+        m = tk.Menu(self, tearoff=0, bg=PANEL, fg=FG, activebackground=EMBER1, activeforeground="#1A0A04",
+                    bd=0, relief="flat", font=(self.f_body, 10))
+        m.add_command(label="Réglages (version, loader, RAM)...", command=lambda: self.configure_instance(inst))
+        m.add_command(label="Renommer...", command=lambda: self.rename_instance(inst))
+        m.add_command(label="Ouvrir le dossier", command=lambda: webbrowser.open(inst["folder"].as_uri()))
+        m.add_separator()
+        m.add_command(label="Afficher à nouveau" if inst["hidden"] else "Masquer",
+                      command=lambda: self.toggle_hidden(inst))
+        m.add_command(label="Supprimer...", command=lambda: self.delete_instance(inst))
+        try:
+            m.tk_popup(widget.winfo_rootx(), widget.winfo_rooty() + widget.winfo_height())
+        finally:
+            m.grab_release()
+
+    def small_dialog(self, title, width, height):
+        win = tk.Toplevel(self)
+        win.title(title)
+        win.geometry(f"{width}x{height}+{self.winfo_x() + 70}+{self.winfo_y() + 140}")
+        win.configure(bg=BG)
+        win.resizable(False, False)
+        win.transient(self)
+        return win
+
+    def toggle_hidden(self, inst):
+        if inst["hidden"]:
+            update_meta(inst["folder"], remove=["hidden"])
+        else:
+            update_meta(inst["folder"], set={"hidden": True})
+        self.refresh_instances(force=True)
+
+    def rename_instance(self, inst):
+        win = self.small_dialog("Renommer l'instance", 420, 220)
+        tk.Label(win, text="RENOMMER", bg=BG, fg=FG, font=(self.f_display, 12, "bold")).pack(pady=(16, 2))
+        GradientBar(win).pack(fill="x", padx=20, pady=8)
+        tk.Label(win, text="NOUVEAU NOM", bg=BG, fg=MUTED, anchor="w", font=(self.f_mono, 8)).pack(fill="x", padx=24)
+        var = tk.StringVar(value=inst["display"])
+        entry = ttk.Entry(win, textvariable=var)
+        entry.pack(fill="x", padx=24, pady=(0, 6))
+        entry.focus_set()
+        entry.select_range(0, "end")
+        tk.Label(win, text="Seul le nom affiché dans WeCraft change : le dossier de l'instance\n"
+                 "n'est pas renommé. Champ vide = nom d'origine.", bg=BG, fg=MUTED, justify="left",
+                 anchor="w", font=(self.f_mono, 8)).pack(fill="x", padx=24)
+
+        def save(_e=None):
+            name = var.get().strip()[:60]
+            if name and name != inst["name"]:
+                update_meta(inst["folder"], set={"name": name})
+            else:
+                update_meta(inst["folder"], remove=["name"])
+            win.destroy()
+            self.refresh_instances(force=True)
+
+        entry.bind("<Return>", save)
+        win.bind("<Escape>", lambda e: win.destroy())
+        row = tk.Frame(win, bg=BG)
+        row.pack(fill="x", padx=24, pady=12)
+        GradientButton(row, text="ENREGISTRER", command=save, font=(self.f_display, 9, "bold"),
+                       height=38).pack(side="left", fill="x", expand=True)
+        ttk.Button(row, text="Annuler", command=win.destroy).pack(side="left", padx=(8, 0))
+
+    def delete_instance(self, inst):
+        """Suppression définitive du dossier, uniquement après confirmation (réponse par défaut : Non)."""
+        if self.busy:
+            messagebox.showinfo("Suppression", "Un lancement est en cours : réessayez dans un instant.")
+            return
+        folder = inst["folder"]
+        if not safe_to_delete(folder):
+            messagebox.showerror("Suppression refusée", f"Ce dossier ne peut pas être supprimé ici :\n{folder}")
+            return
+        msg = (f"Supprimer définitivement « {inst['display']} » ?\n\n"
+               f"Le dossier suivant et TOUT son contenu (mods, mondes, captures, options...) sera effacé :\n"
+               f"{folder}\n\nCette action est irréversible.")
+        if inst["source"] != "WeCraft":
+            msg += (f"\n\nCette instance vient de {inst['source']} : elle disparaîtra aussi de cette application. "
+                    "Pour seulement la cacher dans WeCraft, choisissez « Masquer » à la place.")
+        if not messagebox.askyesno("Supprimer l'instance", msg, icon="warning", default="no", parent=self):
+            return
+        self.set_status(f"Suppression de « {inst['display']} »...")
+
+        def worker():
+            try:
+                remove_tree(folder)
+                forget_meta(folder)
+                self.after(0, lambda: (self.set_status(f"Instance « {inst['display']} » supprimée."),
+                                       self.refresh_instances(force=True, rescan=True)))
+            except Exception as exc:
+                err = str(exc)
+                self.after(0, lambda: (self.set_status("Suppression incomplète."),
+                                       messagebox.showerror("Suppression", f"Impossible de tout supprimer :\n{err}"),
+                                       self.refresh_instances(force=True, rescan=True)))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def play_instance(self, inst):
         if not inst["version"]:
@@ -935,20 +1186,16 @@ class Launcher(tk.Tk):
             version=inst["version"], custom=False, game_dir=str(inst["path"]), loader_name=loader,
             ram=inst["ram"] or int(float(self.ram_var.get())), then_launch=True,
             loader_version=inst["loader_version"] if loader != "Vanilla" else None,
-            force=False, profile=profile_name_for(inst["name"]),
+            force=False, profile=profile_name_for(inst["display"]),
         )
         self.set_buttons("disabled")
         threading.Thread(target=self.play_worker, kwargs=params, daemon=True).start()
 
     def configure_instance(self, inst, then_launch=False):
-        """Réglages d'une instance (version, loader, RAM) enregistrés dans son « wecraft.json »."""
-        win = tk.Toplevel(self)
-        win.title("Réglages de l'instance")
-        win.geometry(f"420x330+{self.winfo_x() + 70}+{self.winfo_y() + 140}")
-        win.configure(bg=BG)
-        win.resizable(False, False)
-        win.transient(self)
-        tk.Label(win, text=inst["name"], bg=BG, fg=FG, font=(self.f_display, 12, "bold")).pack(pady=(16, 2))
+        """Réglages d'une instance (version, loader, RAM), enregistrés par WeCraft : le dossier
+        de l'instance n'est jamais modifié."""
+        win = self.small_dialog("Réglages de l'instance", 420, 330)
+        tk.Label(win, text=inst["display"], bg=BG, fg=FG, font=(self.f_display, 12, "bold")).pack(pady=(16, 2))
         GradientBar(win).pack(fill="x", padx=20, pady=8)
 
         def field(label):
@@ -972,28 +1219,23 @@ class Launcher(tk.Tk):
             if not version:
                 messagebox.showinfo("Version", "Indiquez la version de Minecraft.", parent=win)
                 return
-            file = inst["folder"] / "wecraft.json"
-            try:
-                cfg = json.loads(file.read_text(encoding="utf-8"))
-            except Exception:
-                cfg = {}
             loader = loader_var.get()
             keep_lv = (version == inst["version"] and (loader if loader != "Vanilla" else None) == inst["loader"])
-            cfg.update(version=version, loader=loader,
-                       loader_version=inst["loader_version"] if keep_lv else None)
+            changes = {"version": version, "loader": loader,
+                       "loader_version": inst["loader_version"] if keep_lv else None}
             if ram_var.get().isdigit():
-                cfg["ram"] = int(ram_var.get())
-            else:
-                cfg.pop("ram", None)
+                changes["ram"] = int(ram_var.get())
             try:
-                file.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+                update_meta(inst["folder"], set=changes, remove=[] if "ram" in changes else ["ram"])
             except Exception as e:
                 messagebox.showerror("Erreur", f"Impossible d'enregistrer : {e}", parent=win)
                 return
             win.destroy()
             self.refresh_instances(force=True)
             if then_launch:
-                self.play_instance(read_local_instance(inst["folder"]))
+                fresh = self.find_instance(inst["folder"])
+                if fresh:
+                    self.play_instance(fresh)
 
         row = tk.Frame(win, bg=BG)
         row.pack(fill="x", padx=24, pady=4)
@@ -1274,8 +1516,9 @@ class Launcher(tk.Tk):
             self.set_status(f"Profil « {profile} » prêt ({launch_id})")
             if then_launch:
                 self.after(0, lambda: self.start_official(profile))
-        except Exception as e:
-            self.after(0, lambda: messagebox.showerror("Erreur", str(e)))
+        except Exception as exc:
+            err = str(exc)
+            self.after(0, lambda: messagebox.showerror("Erreur", err))
             self.set_status("Erreur.")
         finally:
             self.after(0, lambda: self.set_buttons("normal"))
