@@ -490,7 +490,7 @@ def _http(url, timeout=10):
 
 def fetch_latest_release():
     """Dernière release publiée sur GitHub : version, notes, .exe et son empreinte SHA-256."""
-    with _http(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest") as r:
+    with _http(f"https://api.github.com/repos/Rexidelamort/WeCraft-Launcher/releases/latest") as r:
         d = json.load(r)
     assets = d.get("assets", [])
     exe = next((a for a in assets if a["name"].lower().endswith(".exe")), None)
