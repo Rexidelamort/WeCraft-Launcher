@@ -2,8 +2,9 @@
 WeCraft - Launcher Minecraft - Python + Tkinter
 Dépendance : pip install -U minecraft-launcher-lib   (version 8 ou plus récente)
 
-Principe : ce launcher utilise vos instances CurseForge, Modrinth ou Prism (version +
-mod loader lus automatiquement). Au clic sur LANCER, il installe si besoin la version et
+Principe : déposez un dossier d'instance dans le dossier « instances » (%APPDATA%/.wecraft/instances) :
+un bouton LANCER apparaît automatiquement. Les instances CurseForge, Modrinth ou Prism
+(version + mod loader lus automatiquement) restent aussi utilisables en mode manuel. Au clic sur LANCER, il installe si besoin la version et
 le loader, crée (ou met à jour) le profil « WECRAFT - <instance> » dans le
 launcher officiel avec le dossier de jeu de l'instance, puis ouvre le launcher officiel. La connexion
 Microsoft et le lancement du jeu restent gérés par le launcher officiel.
@@ -46,6 +47,7 @@ if not CONFIG_FILE.exists() and (_OLD_DIR / "launcher_config.json").exists():
         pass
 FROZEN = getattr(sys, "frozen", False)  # True quand le launcher est un .exe (PyInstaller)
 APP_DIR = Path(sys.executable).parent if FROZEN else Path(__file__).resolve().parent
+INSTANCES_DIR = Path(MC_DIR) / "instances"  # %APPDATA%/.wecraft/instances : un sous-dossier = une instance
 RES_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))  # assets/ et fonts/ intégrés au .exe
 
 # Mises à jour automatiques via les « Releases » GitHub (dépôt PUBLIC)
@@ -186,6 +188,71 @@ def detect_instances():
     return found
 
 
+
+def read_local_instance(folder):
+    """Instance déposée dans « instances/ » : version et loader lus dans les fichiers présents
+    (CurseForge, Prism, export CurseForge, export Modrinth) ou dans « wecraft.json » (prioritaire)."""
+    inst = {"name": folder.name, "folder": folder, "path": folder, "version": None,
+            "loader": None, "loader_version": None, "ram": None}
+    try:
+        if (folder / "mmc-pack.json").exists():  # Prism : le jeu est dans le sous-dossier minecraft
+            _, mc, loader, lv = read_prism(folder)
+            inst.update(version=mc, loader=loader, loader_version=lv)
+            game = next((folder / n for n in ("minecraft", ".minecraft") if (folder / n).is_dir()), None)
+            if game:
+                inst["path"] = game
+        elif (folder / "minecraftinstance.json").exists():
+            _, mc, loader, lv = read_curseforge(folder)
+            inst.update(version=mc, loader=loader, loader_version=lv)
+        elif (folder / "manifest.json").exists():  # export de modpack CurseForge
+            mcd = json.loads((folder / "manifest.json").read_text(encoding="utf-8")).get("minecraft", {})
+            loaders = mcd.get("modLoaders") or []
+            main = next((l for l in loaders if l.get("primary")), loaders[0] if loaders else {})
+            loader, lv = parse_loader(main.get("id"), mcd.get("version"))
+            inst.update(version=mcd.get("version"), loader=loader, loader_version=lv)
+        elif (folder / "modrinth.index.json").exists():  # export .mrpack
+            deps = json.loads((folder / "modrinth.index.json").read_text(encoding="utf-8")).get("dependencies", {})
+            inst["version"] = deps.get("minecraft")
+            for key, nice in (("neoforge", "NeoForge"), ("forge", "Forge"),
+                              ("fabric-loader", "Fabric"), ("quilt-loader", "Quilt")):
+                if key in deps:
+                    inst["loader"], inst["loader_version"] = nice, str(deps[key])
+                    break
+    except Exception:
+        pass
+    try:  # réglages propres à WeCraft : ils priment sur tout le reste
+        cfg = json.loads((folder / "wecraft.json").read_text(encoding="utf-8"))
+        if cfg.get("name"):
+            inst["name"] = str(cfg["name"])
+        if cfg.get("version"):
+            inst["version"] = str(cfg["version"])
+        if "loader" in cfg:
+            inst["loader"] = cfg["loader"]
+        if "loader_version" in cfg:
+            inst["loader_version"] = cfg["loader_version"] or None
+        if cfg.get("ram"):
+            inst["ram"] = int(cfg["ram"])
+    except Exception:
+        pass
+    if inst["loader"] not in LOADERS or inst["loader"] == "Vanilla":
+        inst["loader"] = None
+    if not inst["loader"]:
+        inst["loader_version"] = None
+    return inst
+
+
+def scan_instances():
+    """Sous-dossiers de « instances/ » (ceux qui commencent par . ou _ sont ignorés)."""
+    try:
+        INSTANCES_DIR.mkdir(parents=True, exist_ok=True)
+        folders = sorted((f for f in INSTANCES_DIR.iterdir()
+                          if f.is_dir() and not f.name.startswith((".", "_"))),
+                         key=lambda p: p.name.lower())
+    except Exception:
+        return []
+    return [read_local_instance(f) for f in folders]
+
+
 PROFILE_NAME = "WECRAFT"
 # Selon la version du launcher officiel, les profils sont dans l'un ou l'autre de ces fichiers
 PROFILE_FILES = ("launcher_profiles.json", "launcher_profiles_microsoft_store.json")
@@ -278,7 +345,7 @@ def _http(url, timeout=10):
 
 def fetch_latest_release():
     """Dernière release publiée sur GitHub : version, notes, .exe et son empreinte SHA-256."""
-    with _http(f"https://api.github.com/repos/Rexidelamort/WeCraft-Launcher/releases/latest") as r:
+    with _http(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest") as r:
         d = json.load(r)
     assets = d.get("assets", [])
     exe = next((a for a in assets if a["name"].lower().endswith(".exe")), None)
@@ -372,8 +439,9 @@ class GradientBar(tk.Canvas):
 
 class GradientButton(tk.Canvas):
     """Bouton d'action principal : dégradé braise #FF5A36 -> #FFB84D, coins arrondis."""
-    def __init__(self, master, text, command, font, height=50, radius=12):
-        super().__init__(master, height=height, bg=BG, highlightthickness=0, bd=0, cursor="hand2")
+    def __init__(self, master, text, command, font, height=50, radius=12, width=None, bg=BG):
+        extra = {"width": width} if width else {}
+        super().__init__(master, height=height, bg=bg, highlightthickness=0, bd=0, cursor="hand2", **extra)
         self.text, self.command, self.font, self.radius = text, command, font, radius
         self.state, self.hover, self.pressed = "normal", False, False
         self.bind("<Configure>", lambda e: self.draw())
@@ -425,7 +493,7 @@ class Launcher(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("WeCraft")
-        self.geometry("560x800")
+        self.geometry("560x860")
         self.resizable(False, False)
         self.configure(bg=BG)
         self.apply_style()
@@ -437,9 +505,14 @@ class Launcher(tk.Tk):
         self.loader_version = self.config_data.get("loader_version")  # imposée par l'instance détectée
         self.instance_name = self.config_data.get("instance_name")    # nom CurseForge/Modrinth/Prism
 
+        self.busy = False
+        self.card_buttons = []
+        self._inst_sig = None
         self.build_ui()
         self.load_versions()
         self.check_updates()
+        self.refresh_instances(force=True)
+        self.after(3000, self.poll_instances)
 
     # ---------- Mises à jour ----------
     def check_updates(self):
@@ -589,6 +662,9 @@ class Launcher(tk.Tk):
                      insertcolor=EMBER2, padding=5, font=(mono, 9))
         st.map("TEntry", fieldbackground=[("readonly", FIELD)], foreground=[("readonly", EMBER2)])
         st.configure("Card.Horizontal.TScale", background=PANEL, troughcolor=FIELD, bordercolor=BORDER)
+        st.configure("Vertical.TScrollbar", background="#161D36", troughcolor=BG, bordercolor=BG,
+                     arrowcolor=EMBER2, lightcolor="#161D36", darkcolor="#161D36")
+        st.map("Vertical.TScrollbar", background=[("active", "#1E2748")])
         st.configure("Ember.Horizontal.TProgressbar", troughcolor=FIELD, background="#FF7A3D",
                      bordercolor=BORDER, lightcolor="#FF7A3D", darkcolor="#FF7A3D", thickness=8)
 
@@ -623,20 +699,78 @@ class Launcher(tk.Tk):
         pad = {"padx": 14, "pady": 5}
 
         # En-tête : phénix + wordmark (dossier assets/), sinon titre en texte
-        self.logo = self.wordmark = None
-        self.logo = self.load_image("wecraft_logo.png", height=86)
-        self.wordmark = self.load_image("wecraft_wordmark.png", width=260)
+        self.logo = self.load_image("wecraft_logo.png", height=68)
+        self.wordmark = self.load_image("wecraft_wordmark.png", width=240)
         if self.logo:
-            ttk.Label(self, image=self.logo).pack(pady=(14, 0))
+            ttk.Label(self, image=self.logo).pack(pady=(12, 0))
         if self.wordmark:
-            ttk.Label(self, image=self.wordmark).pack(pady=(10, 0))
+            ttk.Label(self, image=self.wordmark).pack(pady=(8, 0))
         else:
-            ttk.Label(self, text="WECRAFT", style="Title.TLabel").pack(pady=(14, 0))
-        ttk.Label(self, text="MINECRAFT · INSTANCE LAUNCHER", style="Sub.TLabel").pack(pady=(6, 10))
+            ttk.Label(self, text="WECRAFT", style="Title.TLabel").pack(pady=(12, 0))
+        ttk.Label(self, text="MINECRAFT · INSTANCE LAUNCHER", style="Sub.TLabel").pack(pady=(5, 8))
         GradientBar(self).pack(fill="x", padx=14, pady=(0, 6))
 
-        # Instance
-        box = ttk.LabelFrame(self, style="Card.TLabelframe", text="Instance (dossier avec vos mods, mondes...)")
+        # Onglets
+        tabs = tk.Frame(self, bg=BG)
+        tabs.pack(fill="x", padx=16, pady=(2, 2))
+        self.tab_labels = {}
+        for key, text in (("instances", "MES INSTANCES"), ("manual", "MANUEL")):
+            lbl = tk.Label(tabs, text=text, bg=BG, fg=MUTED, cursor="hand2",
+                           font=(self.f_display, 9, "bold"))
+            lbl.pack(side="left", padx=(0, 20))
+            lbl.bind("<Button-1>", lambda e, k=key: self.show_tab(k))
+            self.tab_labels[key] = lbl
+
+        # Bas de fenêtre (packé avant le contenu pour rester toujours visible)
+        tk.Label(self, text=f"v{APP_VERSION}", bg=BG, fg=MUTED, font=(self.f_mono, 8)).pack(side="bottom", pady=(4, 8))
+        tk.Label(self, text="Fermez le launcher officiel avant de cliquer.", bg=BG, fg=MUTED,
+                 font=(self.f_mono, 8)).pack(side="bottom")
+        self.progress = ttk.Progressbar(self, mode="determinate", style="Ember.Horizontal.TProgressbar")
+        self.progress.pack(side="bottom", fill="x", padx=14, pady=6)
+        self.status = ttk.Label(self, text="> Prêt.", style="Status.TLabel", wraplength=500)
+        self.status.pack(side="bottom", fill="x", padx=14)
+
+        box = ttk.LabelFrame(self, style="Card.TLabelframe", text="Mémoire (RAM)")
+        box.pack(side="bottom", fill="x", **pad)
+        self.ram_var = tk.IntVar(value=self.config_data.get("ram", 4))
+        self.ram_text = ttk.Label(box, text="", style="Card.TLabel", font=(self.f_mono, 10, "bold"))
+        self.ram_text.pack(side="right", padx=8)
+        ttk.Scale(
+            box, style="Card.Horizontal.TScale", from_=1, to=16, variable=self.ram_var, command=self.on_ram
+        ).pack(side="left", fill="x", expand=True, padx=8, pady=8)
+        self.on_ram()
+
+        content = tk.Frame(self, bg=BG)
+        content.pack(fill="both", expand=True)
+        self.instances_frame = tk.Frame(content, bg=BG)
+        self.manual_frame = tk.Frame(content, bg=BG)
+
+        # ---------- Onglet « Mes instances » ----------
+        wrap = tk.Frame(self.instances_frame, bg=BG)
+        wrap.pack(fill="both", expand=True, padx=14, pady=(4, 0))
+        canvas = tk.Canvas(wrap, bg=BG, highlightthickness=0, bd=0)
+        sb = ttk.Scrollbar(wrap, orient="vertical", command=canvas.yview)
+        self.cards = tk.Frame(canvas, bg=BG)
+        win_id = canvas.create_window((0, 0), window=self.cards, anchor="nw")
+        self.cards.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win_id, width=e.width))
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.cards_canvas = canvas
+        self.bind_all("<MouseWheel>", lambda e: self.tab == "instances"
+                      and canvas.yview_scroll(int(-e.delta / 120), "units"))
+
+        bar = tk.Frame(self.instances_frame, bg=BG)
+        bar.pack(fill="x", padx=14, pady=(6, 0))
+        ttk.Button(bar, text="Ouvrir le dossier « instances »", command=self.open_instances_dir).pack(side="left")
+        ttk.Button(bar, text="Actualiser", command=lambda: self.refresh_instances(force=True)).pack(side="left", padx=6)
+        tk.Label(self.instances_frame, text="Déposez un dossier d'instance dans « instances » : "
+                 "un bouton LANCER apparaît.", bg=BG, fg=MUTED, font=(self.f_mono, 8)).pack(pady=(6, 0))
+
+        # ---------- Onglet « Manuel » ----------
+        m = self.manual_frame
+        box = ttk.LabelFrame(m, style="Card.TLabelframe", text="Instance (dossier avec vos mods, mondes...)")
         box.pack(fill="x", **pad)
         self.game_dir_var = tk.StringVar(value=self.config_data.get("game_dir", MC_DIR))
         ttk.Entry(box, textvariable=self.game_dir_var, state="readonly").pack(
@@ -650,8 +784,7 @@ class Launcher(tk.Tk):
         ttk.Button(row, text="CurseForge / Modrinth", command=self.detect_dialog).pack(side="left", padx=6)
         ttk.Button(row, text="Par défaut", command=self.use_default_dir).pack(side="left")
 
-        # Version
-        box = ttk.LabelFrame(self, style="Card.TLabelframe", text="Version")
+        box = ttk.LabelFrame(m, style="Card.TLabelframe", text="Version")
         box.pack(fill="x", **pad)
         self.version_var = tk.StringVar(value=self.config_data.get("version", ""))
         self.version_box = ttk.Combobox(box, textvariable=self.version_var, state="readonly")
@@ -678,35 +811,152 @@ class Launcher(tk.Tk):
         loader_box.pack(side="left", padx=8)
         loader_box.bind("<<ComboboxSelected>>", self.on_manual_change)
 
-        # RAM
-        box = ttk.LabelFrame(self, style="Card.TLabelframe", text="Mémoire (RAM)")
-        box.pack(fill="x", **pad)
-        self.ram_var = tk.IntVar(value=self.config_data.get("ram", 4))
-        self.ram_text = ttk.Label(box, text="", style="Card.TLabel", font=(self.f_mono, 10, "bold"))
-        self.ram_text.pack(side="right", padx=8)
-        ttk.Scale(
-            box, style="Card.Horizontal.TScale", from_=1, to=16, variable=self.ram_var, command=self.on_ram
-        ).pack(side="left", fill="x", expand=True, padx=8, pady=8)
-        self.on_ram()
-
-        ttk.Button(self, text="Ouvrir le dossier de l'instance", command=self.open_folder).pack(**pad)
-
-        # Progression
-        self.status = ttk.Label(self, text="> Prêt.", style="Status.TLabel", wraplength=500)
-        self.status.pack(fill="x", padx=14)
-        self.progress = ttk.Progressbar(self, mode="determinate", style="Ember.Horizontal.TProgressbar")
-        self.progress.pack(fill="x", padx=14, pady=6)
-
+        ttk.Button(m, text="Ouvrir le dossier de l'instance", command=self.open_folder).pack(**pad)
         self.launch_btn = GradientButton(
-            self, text="▶  LANCER L'INSTANCE", command=lambda: self.play(then_launch=True),
+            m, text="▶  LANCER L'INSTANCE", command=lambda: self.play(then_launch=True),
             font=(self.f_display, 12, "bold"),
         )
         self.launch_btn.pack(fill="x", padx=14, pady=(10, 6))
-        tk.Label(
-            self, text="Fermez le launcher officiel avant de cliquer.", bg=BG, fg=MUTED,
-            font=(self.f_mono, 8),
-        ).pack()
-        tk.Label(self, text=f"v{APP_VERSION}", bg=BG, fg=MUTED, font=(self.f_mono, 8)).pack(pady=(6, 8))
+
+        self.tab = None
+        self.show_tab("instances")
+
+    # ---------- Onglets et instances déposées ----------
+    def show_tab(self, tab):
+        self.tab = tab
+        for frame in (self.instances_frame, self.manual_frame):
+            frame.pack_forget()
+        (self.instances_frame if tab == "instances" else self.manual_frame).pack(fill="both", expand=True)
+        for key, lbl in self.tab_labels.items():
+            lbl.config(fg=FG if key == tab else MUTED,
+                       font=(self.f_display, 9, "bold") + (("underline",) if key == tab else ()))
+
+    def open_instances_dir(self):
+        INSTANCES_DIR.mkdir(parents=True, exist_ok=True)
+        webbrowser.open(INSTANCES_DIR.as_uri())
+
+    def poll_instances(self):
+        self.refresh_instances()
+        self.after(3000, self.poll_instances)
+
+    def refresh_instances(self, force=False):
+        """Relit « instances/ » : un bouton LANCER apparaît (ou disparaît) pour chaque dossier."""
+        insts = scan_instances()
+        sig = [(i["name"], str(i["path"]), i["version"], i["loader"], i["loader_version"], i["ram"])
+               for i in insts]
+        if force or sig != self._inst_sig:
+            self._inst_sig = sig
+            self.render_instances(insts)
+
+    def render_instances(self, insts):
+        for w in self.cards.winfo_children():
+            w.destroy()
+        self.card_buttons = []
+        if not insts:
+            tk.Label(self.cards, text="Aucune instance pour le moment.\n\nCopiez un dossier d'instance dans le "
+                     "dossier « instances »\n(bouton ci-dessous) : il apparaît ici tout seul.",
+                     bg=BG, fg=MUTED, font=(self.f_body, 10), justify="center").pack(pady=40)
+            return
+        for inst in insts:
+            self.build_card(inst)
+
+    def build_card(self, inst):
+        card = tk.Frame(self.cards, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
+        card.pack(fill="x", padx=(0, 6), pady=4)
+        ttk.Button(card, text="⚙", width=3, command=lambda i=inst: self.configure_instance(i)).pack(
+            side="right", padx=(0, 10))
+        known = bool(inst["version"])
+        btn = GradientButton(card, text="LANCER" if known else "RÉGLER", bg=PANEL, width=112, height=38,
+                             font=(self.f_display, 9, "bold"),
+                             command=lambda i=inst: self.play_instance(i))
+        btn.pack(side="right", padx=8, pady=10)
+        btn.config(state="disabled" if self.busy else "normal")
+        self.card_buttons.append(btn)
+        left = tk.Frame(card, bg=PANEL)
+        left.pack(side="left", fill="x", expand=True, padx=12, pady=10)
+        tk.Label(left, text=inst["name"], bg=PANEL, fg=FG, anchor="w",
+                 font=(self.f_display, 11, "bold")).pack(fill="x")
+        detail = " · ".join(x for x in (inst["version"], inst["loader"], inst["loader_version"],
+                                        f"{inst['ram']} Go" if inst["ram"] else None) if x)
+        tk.Label(left, text=detail or "version inconnue : cliquez sur RÉGLER", bg=PANEL, anchor="w",
+                 fg=BLUE if detail else EMBER2, font=(self.f_mono, 8)).pack(fill="x")
+
+    def play_instance(self, inst):
+        if not inst["version"]:
+            self.configure_instance(inst, then_launch=True)
+            return
+        loader = inst["loader"] if inst["loader"] in LOADERS else "Vanilla"
+        self.save_config()
+        params = dict(
+            version=inst["version"], custom=False, game_dir=str(inst["path"]), loader_name=loader,
+            ram=inst["ram"] or int(float(self.ram_var.get())), then_launch=True,
+            loader_version=inst["loader_version"] if loader != "Vanilla" else None,
+            force=False, profile=profile_name_for(inst["name"]),
+        )
+        self.set_buttons("disabled")
+        threading.Thread(target=self.play_worker, kwargs=params, daemon=True).start()
+
+    def configure_instance(self, inst, then_launch=False):
+        """Réglages d'une instance (version, loader, RAM) enregistrés dans son « wecraft.json »."""
+        win = tk.Toplevel(self)
+        win.title("Réglages de l'instance")
+        win.geometry(f"420x330+{self.winfo_x() + 70}+{self.winfo_y() + 140}")
+        win.configure(bg=BG)
+        win.resizable(False, False)
+        win.transient(self)
+        tk.Label(win, text=inst["name"], bg=BG, fg=FG, font=(self.f_display, 12, "bold")).pack(pady=(16, 2))
+        GradientBar(win).pack(fill="x", padx=20, pady=8)
+
+        def field(label):
+            tk.Label(win, text=label, bg=BG, fg=MUTED, anchor="w", font=(self.f_mono, 8)).pack(fill="x", padx=24)
+
+        field("VERSION DE MINECRAFT")
+        ver_var = tk.StringVar(value=inst["version"] or "")
+        versions = [v["id"] for v in self.all_versions if v["type"] == "release"]
+        ttk.Combobox(win, textvariable=ver_var, values=versions).pack(fill="x", padx=24, pady=(0, 8))
+        field("MOD LOADER")
+        loader_var = tk.StringVar(value=inst["loader"] or "Vanilla")
+        ttk.Combobox(win, textvariable=loader_var, values=list(LOADERS), state="readonly").pack(
+            fill="x", padx=24, pady=(0, 8))
+        field("RAM (Go)")
+        ram_var = tk.StringVar(value=str(inst["ram"]) if inst["ram"] else "Défaut")
+        ttk.Combobox(win, textvariable=ram_var, values=["Défaut"] + [str(i) for i in range(1, 17)],
+                     state="readonly").pack(fill="x", padx=24, pady=(0, 10))
+
+        def save():
+            version = ver_var.get().strip()
+            if not version:
+                messagebox.showinfo("Version", "Indiquez la version de Minecraft.", parent=win)
+                return
+            file = inst["folder"] / "wecraft.json"
+            try:
+                cfg = json.loads(file.read_text(encoding="utf-8"))
+            except Exception:
+                cfg = {}
+            loader = loader_var.get()
+            keep_lv = (version == inst["version"] and (loader if loader != "Vanilla" else None) == inst["loader"])
+            cfg.update(version=version, loader=loader,
+                       loader_version=inst["loader_version"] if keep_lv else None)
+            if ram_var.get().isdigit():
+                cfg["ram"] = int(ram_var.get())
+            else:
+                cfg.pop("ram", None)
+            try:
+                file.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+            except Exception as e:
+                messagebox.showerror("Erreur", f"Impossible d'enregistrer : {e}", parent=win)
+                return
+            win.destroy()
+            self.refresh_instances(force=True)
+            if then_launch:
+                self.play_instance(read_local_instance(inst["folder"]))
+
+        row = tk.Frame(win, bg=BG)
+        row.pack(fill="x", padx=24, pady=4)
+        GradientButton(row, text="ENREGISTRER" + (" ET LANCER" if then_launch else ""), command=save,
+                       font=(self.f_display, 9, "bold"), height=38).pack(side="left", fill="x", expand=True)
+        ttk.Button(row, text="Dossier", command=lambda: webbrowser.open(inst["folder"].as_uri())).pack(
+            side="left", padx=(8, 0))
 
     def on_ram(self, *_):
         self.ram_text.config(text=f"{int(float(self.ram_var.get()))} Go")
@@ -886,7 +1136,12 @@ class Launcher(tk.Tk):
         threading.Thread(target=self.play_worker, kwargs=params, daemon=True).start()
 
     def set_buttons(self, state):
-        self.launch_btn.config(state=state)
+        self.busy = state == "disabled"
+        for b in [self.launch_btn] + self.card_buttons:
+            try:
+                b.config(state=state)
+            except tk.TclError:
+                pass  # carte supprimée entre-temps
 
     def start_official(self, profile=PROFILE_NAME):
         if open_official_launcher():
