@@ -1,1 +1,45 @@
+name: Release WeCraft
 
+# Publie une release (avec WeCraft.exe) à chaque tag « vX.Y.Z »
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Dépendances
+        run: pip install pyinstaller minecraft-launcher-lib pillow
+
+      - name: Numéro de version = nom du tag
+        run: python set_version.py "${{ github.ref_name }}"
+
+      - name: Compilation de l'exe
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force fonts | Out-Null
+          pyinstaller --onefile --windowed --name WeCraft --add-data "assets;assets" --add-data "fonts;fonts" wecraft_launcher.py
+
+      - name: Empreinte SHA-256
+        shell: pwsh
+        run: |
+          $h = (Get-FileHash dist/WeCraft.exe -Algorithm SHA256).Hash.ToLower()
+          "$h  WeCraft.exe" | Out-File dist/WeCraft.exe.sha256 -Encoding ascii
+
+      - name: Publication de la release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/WeCraft.exe
+            dist/WeCraft.exe.sha256
+          generate_release_notes: true
