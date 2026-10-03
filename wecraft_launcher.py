@@ -50,7 +50,7 @@ RES_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))  # assets/ et fonts/ intégré
 
 # Mises à jour automatiques via les « Releases » GitHub (dépôt PUBLIC)
 APP_VERSION = "1.0.0"  # mis à jour automatiquement par le workflow GitHub à chaque release
-GITHUB_REPO = "TON-PSEUDO/wecraft-launcher"  # <-- À MODIFIER : « pseudo/nom-du-depot »
+GITHUB_REPO = "TON-PSEUDO/WeCraft-Launcher"  # <-- À MODIFIER : « pseudo/nom-du-depot »
 
 # Charte WeCraft : noir spatial, blanc chaud, dégradé braise, bleu étoilé
 BG, PANEL, FG = "#05060C", "#0F1424", "#EEECE4"
@@ -238,28 +238,6 @@ def set_profile(base_dir, name, version_id, game_dir, ram):
         f.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
-LAUNCHER_RESTART_DELAY = 10  # secondes entre la fermeture et la réouverture du launcher officiel
-
-
-def close_official_launcher():
-    """Ferme le launcher officiel s'il est ouvert (sans toucher à une partie en cours :
-    seul le processus du launcher est arrêté, pas ses processus enfants)."""
-    try:
-        if sys.platform.startswith("win"):
-            cmds = [["taskkill", "/F", "/IM", "MinecraftLauncher.exe"]]
-            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        elif sys.platform == "darwin":
-            cmds, flags = [["osascript", "-e", 'tell application "Minecraft" to quit']], 0
-        else:
-            cmds = [["pkill", "-x", "minecraft-launcher"], ["flatpak", "kill", "com.mojang.Minecraft"]]
-            flags = 0
-        for cmd in cmds:
-            if shutil.which(cmd[0]):
-                subprocess.run(cmd, capture_output=True, creationflags=flags)
-    except Exception:
-        pass
-
-
 def open_official_launcher():
     """Ouvre le launcher officiel (version Microsoft Store ou classique). False si échec."""
     try:
@@ -300,7 +278,7 @@ def _http(url, timeout=10):
 
 def fetch_latest_release():
     """Dernière release publiée sur GitHub : version, notes, .exe et son empreinte SHA-256."""
-    with _http(f"https://api.github.com/repos/Rexidelamort/WeCraft-Launcher/releases/latest") as r:
+    with _http(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest") as r:
         d = json.load(r)
     assets = d.get("assets", [])
     exe = next((a for a in assets if a["name"].lower().endswith(".exe")), None)
@@ -725,7 +703,7 @@ class Launcher(tk.Tk):
         )
         self.launch_btn.pack(fill="x", padx=14, pady=(10, 6))
         tk.Label(
-            self, text="Le launcher officiel est fermé puis relancé automatiquement (10 s).", bg=BG, fg=MUTED,
+            self, text="Fermez le launcher officiel avant de cliquer.", bg=BG, fg=MUTED,
             font=(self.f_mono, 8),
         ).pack()
         tk.Label(self, text=f"v{APP_VERSION}", bg=BG, fg=MUTED, font=(self.f_mono, 8)).pack(pady=(6, 8))
@@ -971,10 +949,6 @@ class Launcher(tk.Tk):
                     loader_version=None, force=False, profile=PROFILE_NAME):
         try:
             Path(game_dir).mkdir(parents=True, exist_ok=True)
-            # 1) On coupe d'abord le launcher officiel (il réécrirait sinon ses profils)
-            self.set_status("Fermeture du launcher officiel...")
-            close_official_launcher()
-            closed_at = time.monotonic()
             callback = {
                 "setStatus": self.set_status,
                 "setProgress": lambda v: self.set_progress(v),
@@ -994,13 +968,6 @@ class Launcher(tk.Tk):
             self.set_progress(0)
             self.set_status(f"Profil « {profile} » prêt ({launch_id})")
             if then_launch:
-                # 2) On le relance 10 s après sa fermeture (moins si l'installation a pris du temps)
-                while True:
-                    left = LAUNCHER_RESTART_DELAY - (time.monotonic() - closed_at)
-                    if left <= 0:
-                        break
-                    self.set_status(f"Lancement du launcher officiel dans {math.ceil(left)} s...")
-                    time.sleep(min(1, left))
                 self.after(0, lambda: self.start_official(profile))
         except Exception as e:
             self.after(0, lambda: messagebox.showerror("Erreur", str(e)))
