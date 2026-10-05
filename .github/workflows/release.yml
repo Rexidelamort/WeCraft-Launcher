@@ -21,14 +21,14 @@ jobs:
       - name: Dépendances
         run: pip install pyinstaller minecraft-launcher-lib pillow
 
-      - name: Numéro de version = nom du tag
-        run: python set_version.py "${{ github.ref_name }}"
+      - name: Version = nom du tag, dépôt = ce dépôt
+        run: python set_version.py "${{ github.ref_name }}" "${{ github.repository }}"
 
       - name: Compilation de l'exe
         shell: pwsh
         run: |
           New-Item -ItemType File -Force fonts/.keep | Out-Null
-          pyinstaller --onefile --windowed --name WeCraft --add-data "assets;assets" --add-data "fonts;fonts" wecraft_launcher.py
+          pyinstaller --onefile --windowed --icon assets/wecraft.ico --name WeCraft --add-data "assets;assets" --add-data "fonts;fonts" wecraft_launcher.py
 
       - name: Empreinte SHA-256
         shell: pwsh
