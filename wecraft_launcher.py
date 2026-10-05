@@ -243,22 +243,44 @@ def read_local_instance(folder):
     return inst
 
 
+_LOCAL_CACHE = {}  # dossier -> (date de modification, instance lue) : évite de tout relire toutes les 3 s
+
+
 def scan_instances():
-    """Sous-dossiers de « instances/ » (ceux qui commencent par . ou _ sont ignorés)."""
+    """Sous-dossiers de « instances/ » (ceux qui commencent par . ou _ sont ignorés).
+    Seuls les dossiers nouveaux ou modifiés sont relus : reste rapide avec des milliers d'instances."""
     try:
         INSTANCES_DIR.mkdir(parents=True, exist_ok=True)
-        folders = sorted((f for f in INSTANCES_DIR.iterdir()
-                          if f.is_dir() and not f.name.startswith((".", "_"))),
-                         key=lambda p: p.name.lower())
+        with os.scandir(INSTANCES_DIR) as it:
+            entries = sorted((e for e in it if e.is_dir() and not e.name.startswith((".", "_"))),
+                             key=lambda e: e.name.lower())
     except Exception:
         return []
-    return [read_local_instance(f) for f in folders]
+    out, seen = [], set()
+    for e in entries:
+        try:
+            mtime = e.stat().st_mtime_ns
+        except OSError:
+            continue
+        seen.add(e.path)
+        hit = _LOCAL_CACHE.get(e.path)
+        if hit and hit[0] == mtime:
+            out.append(dict(hit[1]))
+        else:
+            inst = read_local_instance(Path(e.path))
+            _LOCAL_CACHE[e.path] = (mtime, dict(inst))
+            out.append(inst)
+    for k in [k for k in _LOCAL_CACHE if k not in seen]:
+        del _LOCAL_CACHE[k]
+    return out
 
 
 
 # ---- Toutes les instances (dossier WeCraft + CurseForge / Modrinth / Prism) et réglages perso
 META_FILE = Path(MC_DIR) / "instances_meta.json"  # nom affiché, masquée, version/loader/RAM forcés
 SOURCE_ORDER = {"WeCraft": 0, "CurseForge": 1, "Modrinth": 2, "Prism": 3}
+PAGE_SIZE = 20  # instances affichées par page (reste fluide même avec 10 000 instances)
+SORTS = ("Source puis nom", "Nom (A-Z)", "Nom (Z-A)", "Version (récente)", "Version (ancienne)")
 SOURCE_LABEL = {"WeCraft": "WECRAFT", "CurseForge": "CURSEFORGE", "Modrinth": "MODRINTH", "Prism": "PRISM"}
 
 
@@ -329,6 +351,7 @@ def apply_meta(instances):
             i["loader_version"] = None
         i["display"] = (m.get("name") or "").strip() or i["name"]
         i["hidden"] = bool(m.get("hidden"))
+        i["_hay"] = f"{i['display']} {i['name']} {i['version'] or ''} {i['loader'] or 'vanilla'} {i['source']}".lower()
     return instances
 
 
@@ -665,6 +688,8 @@ class Launcher(tk.Tk):
         self.card_buttons = []
         self._inst_sig = None
         self._instances, self._ext, self._ext_time = [], None, 0.0
+        self._scanning, self._queued, self._search_job, self.page = False, None, None, 0
+        self.set_app_icon()
         self.build_ui()
         self.load_versions()
         self.check_updates()
@@ -783,6 +808,22 @@ class Launcher(tk.Tk):
         return self.game_dir_var.get().strip() or MC_DIR
 
     # ---------- Interface ----------
+    def set_app_icon(self):
+        """Logo de la fenêtre et de la barre des tâches (assets/wecraft.ico ou wecraft_icon.png)."""
+        ico = next((p for p in (RES_DIR / "assets" / "wecraft.ico", RES_DIR / "wecraft.ico") if p.exists()), None)
+        try:
+            if ico and sys.platform.startswith("win"):
+                self.iconbitmap(default=str(ico))
+                return
+        except tk.TclError:
+            pass
+        try:
+            self._icon = self.load_image("wecraft_icon.png", height=128)
+            if self._icon:
+                self.iconphoto(True, self._icon)
+        except Exception:
+            pass
+
     def apply_style(self):
         """Charte WeCraft : Unbounded (titres), Inter (texte), JetBrains Mono (données)."""
         load_local_fonts()
@@ -932,8 +973,50 @@ class Launcher(tk.Tk):
         self.manual_frame = tk.Frame(content, bg=BG)
 
         # ---------- Onglet « Mes instances » ----------
+        mono8 = (self.f_mono, 8)
+        self.top_row = tk.Frame(self.instances_frame, bg=BG)
+        self.top_row.pack(fill="x", padx=14, pady=(4, 0))
+        tk.Label(self.top_row, text="RECHERCHE", bg=BG, fg=MUTED, font=mono8).pack(side="left", padx=(0, 8))
+        self.search_var = tk.StringVar()
+        self.search_entry = ttk.Entry(self.top_row, textvariable=self.search_var)
+        self.search_entry.pack(side="left", fill="x", expand=True)
+        self.filter_btn = ttk.Button(self.top_row, text="Filtres ▾", command=self.toggle_filters)
+        self.filter_btn.pack(side="left", padx=(8, 0))
+        self.search_var.trace_add("write", lambda *_: self.schedule_filter())
+        self.search_entry.bind("<Escape>", lambda e: self.search_var.set(""))
+        self.bind_all("<Control-f>", lambda e: (self.show_tab("instances"), self.search_entry.focus_set(),
+                                                self.search_entry.select_range(0, "end")))
+
+        # Panneau de filtres (replié par défaut)
+        self.filters_open = False
+        self.filter_panel = tk.Frame(self.instances_frame, bg=PANEL, highlightthickness=1,
+                                     highlightbackground=BORDER)
+        fp = self.filter_panel
+        for c in range(3):
+            fp.columnconfigure(c, weight=1, uniform="f")
+        self.src_var, self.ldr_var = tk.StringVar(value="Toutes"), tk.StringVar(value="Tous")
+        self.ver_var, self.sort_var = tk.StringVar(value="Toutes"), tk.StringVar(value=SORTS[0])
+        self.show_hidden = tk.BooleanVar(value=False)
+
+        def combo(label, var, values, col, row):
+            tk.Label(fp, text=label, bg=PANEL, fg=MUTED, font=mono8).grid(
+                row=row * 2, column=col, sticky="w", padx=8, pady=(6, 0))
+            cb = ttk.Combobox(fp, textvariable=var, values=values, state="readonly", width=10)
+            cb.grid(row=row * 2 + 1, column=col, sticky="we", padx=8, pady=(0, 4))
+            cb.bind("<<ComboboxSelected>>", lambda e: self.apply_filter())
+            return cb
+
+        combo("SOURCE", self.src_var, ["Toutes", "WeCraft", "CurseForge", "Modrinth", "Prism"], 0, 0)
+        combo("LOADER", self.ldr_var, ["Tous"] + list(LOADERS), 1, 0)
+        self.ver_box = combo("VERSION", self.ver_var, ["Toutes"], 2, 0)
+        combo("TRI", self.sort_var, list(SORTS), 0, 1)
+        ttk.Checkbutton(fp, text="Voir les masquées", variable=self.show_hidden, style="Card.TCheckbutton",
+                        command=self.apply_filter).grid(row=3, column=1, sticky="w", padx=8, pady=(0, 6))
+        ttk.Button(fp, text="Réinitialiser", command=self.reset_filters).grid(
+            row=3, column=2, sticky="we", padx=8, pady=(0, 6))
+
         wrap = tk.Frame(self.instances_frame, bg=BG)
-        wrap.pack(fill="both", expand=True, padx=14, pady=(4, 0))
+        wrap.pack(fill="both", expand=True, padx=14, pady=(6, 0))
         canvas = tk.Canvas(wrap, bg=BG, highlightthickness=0, bd=0)
         sb = ttk.Scrollbar(wrap, orient="vertical", command=canvas.yview)
         self.cards = tk.Frame(canvas, bg=BG)
@@ -952,11 +1035,16 @@ class Launcher(tk.Tk):
         ttk.Button(bar, text="Dossier instances", command=self.open_instances_dir).pack(side="left")
         ttk.Button(bar, text="Actualiser",
                    command=lambda: self.refresh_instances(force=True, rescan=True)).pack(side="left", padx=6)
-        self.show_hidden = tk.BooleanVar(value=False)
-        ttk.Checkbutton(bar, text="Voir les masquées", variable=self.show_hidden, style="Bar.TCheckbutton",
-                        command=lambda: self.refresh_instances(force=True)).pack(side="right")
-        tk.Label(self.instances_frame, text="CurseForge, Modrinth et Prism sont détectés automatiquement.",
-                 bg=BG, fg=MUTED, font=(self.f_mono, 8)).pack(pady=(6, 0))
+        pag = tk.Frame(bar, bg=BG)
+        pag.pack(side="right")
+        self.prev_btn = ttk.Button(pag, text="◀", width=3, command=lambda: self.go_page(-1))
+        self.prev_btn.pack(side="left")
+        self.page_label = tk.Label(pag, text="1 / 1", bg=BG, fg=FG, width=11, font=(self.f_mono, 9, "bold"))
+        self.page_label.pack(side="left")
+        self.next_btn = ttk.Button(pag, text="▶", width=3, command=lambda: self.go_page(1))
+        self.next_btn.pack(side="left")
+        self.count_label = tk.Label(self.instances_frame, text="", bg=BG, fg=MUTED, font=mono8)
+        self.count_label.pack(pady=(6, 0))
 
         # ---------- Onglet « Manuel » ----------
         m = self.manual_frame
@@ -1030,32 +1118,139 @@ class Launcher(tk.Tk):
         self.after(3000, self.poll_instances)
 
     def refresh_instances(self, force=False, rescan=False):
-        """Relit « instances/ » toutes les 3 s ; CurseForge / Modrinth / Prism toutes les 30 s
-        (ou via « Actualiser »). Un bouton LANCER apparaît pour chaque instance trouvée."""
-        if rescan or self._ext is None or time.monotonic() - self._ext_time > 30:
-            self._ext, self._ext_time = detect_external(), time.monotonic()
-        insts = apply_meta(scan_instances() + self._ext)
-        insts.sort(key=lambda i: (SOURCE_ORDER.get(i["source"], 9), i["display"].lower()))
-        self._instances = insts
-        shown = [i for i in insts if self.show_hidden.get() or not i["hidden"]]
-        sig = [(i["display"], i["hidden"], i["source"], str(i["path"]), i["version"], i["loader"],
-                i["loader_version"], i["ram"]) for i in shown]
-        if force or sig != self._inst_sig:
-            self._inst_sig = sig
-            self.render_instances(shown, hidden_count=len(insts) - len(shown))
+        """Relit les instances EN ARRIÈRE-PLAN (la fenêtre ne se fige jamais, même avec des milliers) :
+        « instances/ » toutes les 3 s (seuls les dossiers modifiés sont relus),
+        CurseForge / Modrinth / Prism toutes les 60 s ou via « Actualiser »."""
+        if self._scanning:
+            if force or rescan:  # rejoué dès que le scan en cours est fini
+                old = self._queued or (False, False)
+                self._queued = (old[0] or force, old[1] or rescan)
+            return
+        do_ext = rescan or self._ext is None or time.monotonic() - self._ext_time > 60
+        ext_cache = self._ext or []
+        self._scanning = True
+
+        def worker():
+            try:
+                if rescan:
+                    _LOCAL_CACHE.clear()
+                local = scan_instances()
+                ext = detect_external() if do_ext else None
+                base = [dict(e) for e in (ext if ext is not None else ext_cache)]
+                insts = apply_meta(local + base)
+                insts.sort(key=lambda i: (SOURCE_ORDER.get(i["source"], 9), i["display"].lower()))
+            except Exception:
+                insts, ext = None, None
+            self.after(0, lambda: self._scan_done(insts, ext, force))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _scan_done(self, insts, ext, force):
+        self._scanning = False
+        if ext is not None:
+            self._ext, self._ext_time = ext, time.monotonic()
+        if insts is not None:
+            self._instances = insts
+            versions = sorted({i["version"] for i in insts if i["version"]}, key=version_tuple, reverse=True)
+            self.ver_box["values"] = ["Toutes"] + versions
+            if self.ver_var.get() not in ["Toutes"] + versions:
+                self.ver_var.set("Toutes")
+            self.apply_filter(reset_page=False, force=force)
+        if self._queued:
+            f, r = self._queued
+            self._queued = None
+            self.refresh_instances(force=f, rescan=r)
 
     def find_instance(self, folder):
         return next((i for i in self._instances if meta_key(i["folder"]) == meta_key(folder)), None)
 
-    def render_instances(self, insts, hidden_count=0):
+    # ---------- Recherche, filtres, tri, pagination ----------
+    def schedule_filter(self):
+        if self._search_job:
+            self.after_cancel(self._search_job)
+        self._search_job = self.after(200, self.apply_filter)  # attend la fin de la frappe
+
+    def toggle_filters(self):
+        self.filters_open = not self.filters_open
+        if self.filters_open:
+            self.filter_panel.pack(fill="x", padx=14, pady=(6, 0), after=self.top_row)
+        else:
+            self.filter_panel.pack_forget()
+        self.update_filter_button()
+
+    def active_filters(self):
+        return sum([self.src_var.get() != "Toutes", self.ldr_var.get() != "Tous", self.ver_var.get() != "Toutes",
+                    self.sort_var.get() != SORTS[0], self.show_hidden.get()])
+
+    def update_filter_button(self):
+        n = self.active_filters()
+        self.filter_btn.config(text=f"Filtres{f' ({n})' if n else ''} {'▴' if self.filters_open else '▾'}")
+
+    def reset_filters(self):
+        self.search_var.set("")
+        self.src_var.set("Toutes")
+        self.ldr_var.set("Tous")
+        self.ver_var.set("Toutes")
+        self.sort_var.set(SORTS[0])
+        self.show_hidden.set(False)
+        self.apply_filter()
+
+    def go_page(self, delta):
+        self.page = max(0, self.page + delta)
+        self.apply_filter(reset_page=False)
+        self.cards_canvas.yview_moveto(0)
+
+    def apply_filter(self, reset_page=True, force=False):
+        """Filtre + trie la liste en mémoire puis n'affiche que la page courante."""
+        self._search_job = None
+        if reset_page:
+            self.page = 0
+        words = self.search_var.get().lower().split()
+        src, ldr, ver = self.src_var.get(), self.ldr_var.get(), self.ver_var.get()
+        hidden_ok = self.show_hidden.get()
+        res = [i for i in self._instances
+               if (hidden_ok or not i["hidden"])
+               and (src == "Toutes" or i["source"] == src)
+               and (ldr == "Tous" or (i["loader"] or "Vanilla") == ldr)
+               and (ver == "Toutes" or i["version"] == ver)
+               and all(w in i["_hay"] for w in words)]
+        sort = self.sort_var.get()
+        if sort in ("Nom (A-Z)", "Nom (Z-A)"):
+            res.sort(key=lambda i: i["display"].lower(), reverse=sort == "Nom (Z-A)")
+        elif sort.startswith("Version"):
+            res.sort(key=lambda i: (version_tuple(i["version"]) if i["version"] else (), i["display"].lower()),
+                     reverse=sort == "Version (récente)")
+        total, pages = len(res), max(1, -(-len(res) // PAGE_SIZE))
+        self.page = min(self.page, pages - 1)
+        shown = res[self.page * PAGE_SIZE:(self.page + 1) * PAGE_SIZE]
+
+        everything = len(self._instances)
+        self.count_label.config(text=(f"{total} instance{'s' if total > 1 else ''}" if total == everything
+                                      else f"{total} sur {everything} instances"))
+        self.page_label.config(text=f"{self.page + 1} / {pages}")
+        self.prev_btn.state(["!disabled"] if self.page > 0 else ["disabled"])
+        self.next_btn.state(["!disabled"] if self.page < pages - 1 else ["disabled"])
+        self.update_filter_button()
+
+        sig = (self.page, [(i["display"], i["hidden"], i["source"], str(i["path"]), i["version"], i["loader"],
+                            i["loader_version"], i["ram"]) for i in shown])
+        if force or sig != self._inst_sig:
+            self._inst_sig = sig
+            self.render_instances(shown, filtered=bool(words) or self.active_filters() > 0)
+
+    def render_instances(self, insts, filtered=False):
         for w in self.cards.winfo_children():
             w.destroy()
         self.card_buttons = []
         if not insts:
-            text = ("Toutes vos instances sont masquées.\nCochez « Voir les masquées » pour les afficher."
-                    if hidden_count else
-                    "Aucune instance pour le moment.\n\nCréez-en une dans CurseForge, Modrinth ou Prism,\n"
-                    "ou copiez un dossier dans « Dossier instances » :\nelle apparaît ici toute seule.")
+            if self._instances and filtered:
+                text = "Aucune instance ne correspond.\n\nModifiez la recherche ou cliquez sur « Filtres » puis « Réinitialiser »."
+            elif self._instances:
+                text = "Toutes vos instances sont masquées.\nOuvrez « Filtres » et cochez « Voir les masquées »."
+            else:
+                text = ("Aucune instance pour le moment.\n\nCréez-en une dans CurseForge, Modrinth ou Prism\n"
+                        "(détectés automatiquement), ou copiez un dossier dans\n« Dossier instances » : "
+                        "elle apparaît ici toute seule.")
             tk.Label(self.cards, text=text, bg=BG, fg=MUTED, font=(self.f_body, 10),
                      justify="center").pack(pady=40)
             return
@@ -1239,9 +1434,10 @@ class Launcher(tk.Tk):
             win.destroy()
             self.refresh_instances(force=True)
             if then_launch:
-                fresh = self.find_instance(inst["folder"])
-                if fresh:
-                    self.play_instance(fresh)
+                self.play_instance(dict(
+                    inst, version=version, loader=None if loader == "Vanilla" else loader,
+                    loader_version=changes["loader_version"] if loader != "Vanilla" else None,
+                    ram=changes.get("ram")))
 
         row = tk.Frame(win, bg=BG)
         row.pack(fill="x", padx=24, pady=4)
@@ -1531,4 +1727,8 @@ class Launcher(tk.Tk):
 
 
 if __name__ == "__main__":
+    try:  # Windows : icône du launcher dans la barre des tâches (au lieu de celle de Python)
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("WeCraft.Launcher")
+    except Exception:
+        pass
     Launcher().mainloop()
