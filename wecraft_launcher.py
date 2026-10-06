@@ -1,6 +1,7 @@
 """
 WeCraft - Launcher Minecraft - Python + Tkinter
 Dépendance : pip install -U minecraft-launcher-lib   (version 8 ou plus récente)
+Facultatif : pip install pillow   (icônes des mods en jpg / webp, logo plus net)
 
 Principe : déposez un dossier d'instance dans le dossier « instances » (%APPDATA%/.wecraft/instances) :
 un bouton LANCER apparaît automatiquement. Les instances CurseForge, Modrinth ou Prism
@@ -59,7 +60,7 @@ INSTANCES_DIR = Path(MC_DIR) / "instances"  # %APPDATA%/.wecraft/instances : un 
 RES_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))  # assets/ et fonts/ intégrés au .exe
 
 # Mises à jour automatiques via les « Releases » GitHub (dépôt PUBLIC)
-APP_VERSION = "1.0.0"  # mis à jour automatiquement par le workflow GitHub à chaque release
+APP_VERSION = "1.2.0"  # mis à jour automatiquement par le workflow GitHub à chaque release
 GITHUB_REPO = "Rexidelamort/WeCraft-Launcher"  # rempli automatiquement par le workflow GitHub
 
 # Charte WeCraft : noir spatial, blanc chaud, dégradé braise, bleu étoilé
