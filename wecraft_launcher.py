@@ -14,10 +14,12 @@ import base64
 import ctypes
 import hashlib
 import importlib
+import importlib.util
 import io
 import json
 import math
 import os
+import queue
 import re
 import shutil
 import sqlite3
@@ -25,6 +27,7 @@ import stat
 import subprocess
 import sys
 import uuid
+import zipfile
 import threading
 import urllib.error
 import urllib.parse
@@ -955,6 +958,121 @@ def apply_modpack_edit(folder, meta, selected, progress=lambda done, total, msg:
             "pruned": sum(1 for m in gone if m.get("dependency")), "warnings": warnings}
 
 
+# ------------------------------------------------------------------ WePack : liste des mods
+_MOD_CACHE = {}  # (chemin, taille, date) -> {"name", "version"} lus dans le .jar (évite de relire)
+_JAR_RE = re.compile(r"\.jar(\.disabled)?$", re.I)
+
+
+def _clean(value):
+    """Texte propre ; les variables non remplacées (${version}) sont ignorées."""
+    v = str(value).strip() if value is not None else ""
+    return "" if not v or "${" in v else v
+
+
+def read_mod_jar(path):
+    """Nom et version d'un mod lus dans son .jar (Fabric, Quilt, Forge, NeoForge, ancien Forge).
+    Sinon : nom du fichier."""
+    path = Path(path)
+    fallback = _JAR_RE.sub("", path.name)
+    try:
+        st = path.stat()
+    except OSError:
+        return {"name": fallback, "version": ""}
+    key = (str(path), st.st_size, st.st_mtime_ns)
+    if key in _MOD_CACHE:
+        return _MOD_CACHE[key]
+    name = version = ""
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = set(z.namelist())
+
+            def text(n):
+                return z.read(n).decode("utf-8", "replace")
+
+            if "fabric.mod.json" in names:
+                d = json.loads(text("fabric.mod.json"), strict=False)
+                name, version = _clean(d.get("name")), _clean(d.get("version"))
+            elif "quilt.mod.json" in names:
+                loader = json.loads(text("quilt.mod.json"), strict=False).get("quilt_loader") or {}
+                name = _clean((loader.get("metadata") or {}).get("name"))
+                version = _clean(loader.get("version"))
+            else:
+                toml = next((n for n in ("META-INF/neoforge.mods.toml", "META-INF/mods.toml") if n in names), None)
+                if toml:
+                    t = text(toml)
+                    m = re.search(r'^\s*displayName\s*=\s*"([^"]+)"', t, re.M)
+                    v = re.search(r'^\s*version\s*=\s*"([^"]+)"', t, re.M)
+                    name = _clean(m.group(1)) if m else ""
+                    version = _clean(v.group(1)) if v else ""
+                elif "mcmod.info" in names:
+                    d = json.loads(text("mcmod.info"), strict=False)
+                    if isinstance(d, dict):
+                        d = d.get("modList") or [d]
+                    if d:
+                        name, version = _clean(d[0].get("name")), _clean(d[0].get("version"))
+    except Exception:
+        pass  # jar illisible : on affiche le nom du fichier
+    info = {"name": name or fallback, "version": version}
+    _MOD_CACHE[key] = info
+    return info
+
+
+def count_mod_files(game_dir):
+    """Nombre de mods (.jar) d'un modpack, sans les ouvrir : rapide."""
+    try:
+        with os.scandir(Path(game_dir) / "mods") as it:
+            return sum(1 for e in it if e.is_file() and _JAR_RE.search(e.name))
+    except OSError:
+        return 0
+
+
+def list_pack_mods(game_dir, folder):
+    """Mods d'un modpack WeCraft : [{name, version, file, dep, disabled}] triés par nom.
+    Les noms viennent de wecraft_modpack.json (modpacks créés dans WeCraft), sinon des .jar eux-mêmes."""
+    mods_dir = Path(game_dir) / "mods"
+    known, by_id = {}, {}
+    try:
+        data = json.loads((Path(folder) / "wecraft_modpack.json").read_text(encoding="utf-8"))
+        known = {Path(m.get("filename", "")).name: m for m in data.get("mods", [])}
+        by_id = {m["project_id"]: m for m in data.get("mods", []) if m.get("project_id")}
+    except Exception:
+        pass
+    out = []
+    try:
+        files = [p for p in mods_dir.iterdir() if p.is_file() and _JAR_RE.search(p.name)]
+    except OSError:
+        files = []
+    present = {re.sub(r"\.disabled$", "", p.name, flags=re.I) for p in files}  # mods réellement dans le dossier
+    for p in files:
+        disabled = p.name.lower().endswith(".disabled")
+        k = known.get(p.name) or known.get(re.sub(r"\.disabled$", "", p.name, flags=re.I))
+        parents = []
+        if k:
+            name, version, dep = k.get("title") or _JAR_RE.sub("", p.name), k.get("version") or "", bool(k.get("dependency"))
+            # « dépendance de ... » : les mods encore présents qui ont besoin de celui-ci (modpacks récents)
+            parents = sorted({by_id[r].get("title") or Path(by_id[r].get("filename", "")).stem
+                              for r in k.get("required_by") or []
+                              if r in by_id and Path(by_id[r].get("filename", "")).name in present})
+        else:
+            info = read_mod_jar(p)
+            name, version, dep = info["name"], info["version"], False
+        out.append({"name": name, "version": version, "file": p.name, "dep": dep, "disabled": disabled,
+                    "parents": parents})
+    if not out:  # export Modrinth (.mrpack) pas encore installé : les fichiers sont dans l'index
+        try:
+            idx = json.loads((Path(folder) / "modrinth.index.json").read_text(encoding="utf-8"))
+            for f in idx.get("files", []):
+                path = str(f.get("path", ""))
+                if path.startswith("mods/") and _JAR_RE.search(path):
+                    fname = Path(path).name
+                    out.append({"name": _JAR_RE.sub("", fname), "version": "", "file": fname,
+                                "dep": False, "disabled": False, "parents": []})
+        except Exception:
+            pass
+    out.sort(key=lambda m: m["name"].lower())
+    return out
+
+
 # ------------------------------------------------------------------ style WeCraft
 def lerp_color(c1, c2, t):
     a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
@@ -1103,10 +1221,329 @@ class TileGrid:
             t.grid(row=i // cols, column=i % cols, sticky="nsew", padx=4, pady=4)
 
 
+SPLASH_FADE_IN, SPLASH_START, SPLASH_LOAD, SPLASH_HOLD, SPLASH_FADE_OUT = 0.35, 0.2, 1.3, 0.25, 0.3  # secondes
+
+
+def splash_timeline(t):
+    """Écran de démarrage à l'instant t (secondes) : (opacité 0..1, avancement de la barre 0..1, terminé)."""
+    out_start = SPLASH_START + SPLASH_LOAD + SPLASH_HOLD
+    if t < SPLASH_FADE_IN:
+        alpha = t / SPLASH_FADE_IN
+    elif t < out_start:
+        alpha = 1.0
+    else:
+        alpha = 1.0 - (t - out_start) / SPLASH_FADE_OUT
+    p = min(1.0, max(0.0, (t - SPLASH_START) / SPLASH_LOAD))
+    return max(0.0, min(1.0, alpha)), 1 - (1 - p) ** 3, t >= out_start + SPLASH_FADE_OUT
+
+
+class SplashScreen(tk.Toplevel):
+    """Écran de démarrage : fondu, phénix qui flotte, barre de chargement dégradée. Un clic le passe."""
+    W, BAR_W, BAR_H = 460, 300, 6
+
+    def __init__(self, app, on_done):
+        super().__init__(app)
+        self.on_done, self.finished, self.t0 = on_done, False, None
+        self.overrideredirect(True)
+        self.configure(bg=BG)
+        self.set_alpha(0.0)
+        try:
+            self.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        logo = app.load_image("wecraft_logo.png", height=92)
+        mark = app.load_image("wecraft_wordmark.png", width=230)
+        self._imgs = (logo, mark)  # références gardées (sinon Tk efface les images)
+
+        # mise en page calculée d'après la taille réelle des images
+        cx, y = self.W // 2, 26
+        self.logo_y = y + (logo.height() // 2 if logo else 0)
+        y += (logo.height() + 14) if logo else 0
+        mh = mark.height() if mark else 40
+        mark_y, y = y + mh // 2, y + mh + 10
+        sub_y, y = y + 6, y + 30
+        self.bar_y = y
+        status_y = y + self.BAR_H + 18
+        H = status_y + 26
+        self.geometry(f"{self.W}x{H}+{(self.winfo_screenwidth() - self.W) // 2}"
+                      f"+{(self.winfo_screenheight() - H) // 2 - 20}")
+
+        c = self.canvas = tk.Canvas(self, width=self.W, height=H, bg=BG, highlightthickness=0, bd=0)
+        c.pack()
+        c.create_rectangle(0, 0, self.W - 1, H - 1, outline=EMBER1)
+        self.logo_id = c.create_image(cx, self.logo_y, image=logo) if logo else None
+        if mark:
+            c.create_image(cx, mark_y, image=mark)
+        else:
+            c.create_text(cx, mark_y, text="WECRAFT", fill=FG, font=(app.f_display, 26, "bold"))
+        c.create_text(cx, sub_y, text="MINECRAFT · INSTANCE LAUNCHER", fill=MUTED, font=(app.f_mono, 8))
+        self.bar_x = (self.W - self.BAR_W) // 2
+        c.create_rectangle(self.bar_x, self.bar_y, self.bar_x + self.BAR_W, self.bar_y + self.BAR_H,
+                           fill=FIELD, outline=BORDER)
+        self.status = c.create_text(cx, status_y, text="CHARGEMENT", fill=MUTED, font=(app.f_mono, 8))
+        c.create_text(self.W - 12, H - 10, text=f"v{APP_VERSION}", anchor="se", fill=MUTED, font=(app.f_mono, 8))
+        self.drawn = 0
+        c.bind("<Button-1>", self.skip)
+        self.bind("<Escape>", self.skip)
+
+    def set_alpha(self, a):
+        try:
+            self.attributes("-alpha", a)
+        except tk.TclError:
+            pass  # pas de transparence sur ce système : pas de fondu, c'est tout
+
+    def start(self):
+        self.t0 = time.monotonic()
+        self.tick()
+
+    def skip(self, _e=None):
+        """Passe directement à la fin de l'animation."""
+        if self.t0 is not None:
+            self.t0 = time.monotonic() - (SPLASH_START + SPLASH_LOAD + SPLASH_HOLD)
+
+    def tick(self):
+        if self.finished:
+            return
+        try:
+            t = time.monotonic() - self.t0
+            alpha, progress, over = splash_timeline(t)
+            self.set_alpha(alpha)
+            self.advance(progress)
+            if self.logo_id:  # le phénix flotte doucement
+                self.canvas.coords(self.logo_id, self.W // 2, self.logo_y + 3 * math.sin(t * 3.2))
+            if over:
+                self.finish()
+                return
+            self.after(16, self.tick)
+        except tk.TclError:
+            self.finish()
+
+    def advance(self, progress):
+        """Remplit la barre en dégradé braise jusqu'à progress (0..1), avec un point lumineux en tête."""
+        c, inner = self.canvas, self.BAR_W - 2
+        target = int(inner * progress)
+        for x in range(self.drawn, target):
+            px = self.bar_x + 1 + x
+            c.create_line(px, self.bar_y + 1, px, self.bar_y + self.BAR_H, fill=lerp_color(EMBER1, EMBER2, x / (inner - 1)))
+        self.drawn = max(self.drawn, target)
+        c.delete("head")
+        if 0 < progress < 1:
+            hx = self.bar_x + 1 + target
+            c.create_oval(hx - 4, self.bar_y + self.BAR_H / 2 - 4, hx + 4, self.bar_y + self.BAR_H / 2 + 4,
+                          fill=lerp_color(EMBER2, "#FFFFFF", 0.55), outline="", tags="head")
+        if progress >= 1:
+            c.itemconfigure(self.status, text="PRÊT", fill=EMBER2)
+
+    def finish(self):
+        if self.finished:
+            return
+        self.finished = True
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
+        self.on_done()
+
+
+# ------------------------------------------------------------------ Discord : statut « Joue à WeCraft »
+DISCORD_CLIENT_ID = "1557352573097218068"  # ID d'application Discord (portail développeur) ; vide = pas de statut Discord
+
+
+def discord_client_id(config):
+    """ID d'application : variable WECRAFT_DISCORD_ID, sinon « discord_app_id » du fichier de config, sinon la constante."""
+    return str(os.environ.get("WECRAFT_DISCORD_ID") or config.get("discord_app_id") or DISCORD_CLIENT_ID).strip()
+
+
+def pypresence_available():
+    try:
+        return importlib.util.find_spec("pypresence") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def is_minecraft_cmdline(line):
+    """Ligne de commande d'un processus Java : est-ce Minecraft ? (le jeu reçoit toujours --gameDir)"""
+    low = line.lower()
+    return "--gamedir" in low or "net.minecraft" in low
+
+
+def minecraft_running():
+    """True si Minecraft tourne (Windows : PowerShell, repli sur tasklist ; ailleurs : ps)."""
+    try:
+        if os.name == "nt":
+            cmd = ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                   "Get-CimInstance Win32_Process -Filter \"Name='javaw.exe' OR Name='java.exe'\" "
+                   "| ForEach-Object { $_.CommandLine }"]
+        else:
+            cmd = ["ps", "-eo", "args"]
+        out = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=15,
+                             creationflags=0x08000000 if os.name == "nt" else 0).stdout
+        return any(is_minecraft_cmdline(line) for line in out.splitlines())
+    except Exception:
+        pass
+    if os.name == "nt":  # PowerShell indisponible : on regarde seulement si un javaw.exe tourne
+        try:
+            out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq javaw.exe", "/NH"], capture_output=True,
+                                 text=True, errors="replace", timeout=15, creationflags=0x08000000).stdout
+            return "javaw.exe" in out.lower()
+        except Exception:
+            pass
+    return False
+
+
+class DiscordPresence:
+    """Statut Discord (Rich Presence) : « Joue à <instance> », version, loader, durée de jeu.
+    Tout est facultatif et silencieux : sans pypresence, sans identifiant, ou si Discord est fermé, rien ne se passe.
+    Un seul thread parle à Discord ; le jeu est détecté par son processus Java (le vrai lancement se fait
+    dans le launcher officiel, donc on attend qu'il apparaisse)."""
+    POLL, LAUNCH_WAIT, RETRY = 15, 300, 30  # secondes : vérification du jeu, attente max du jeu, nouvel essai Discord
+
+    def __init__(self, client_id, enabled=True, factory=None, running=None):
+        self.client_id, self.enabled = str(client_id or "").strip(), bool(enabled)
+        self.factory, self.running = factory, running or minecraft_running
+        self.rpc, self._sent, self._retry = None, None, 0.0
+        self.mode, self.info, self.t_launch, self.t_start = "idle", None, 0.0, 0
+        self._q, self._thread = queue.Queue(), None
+
+    @property
+    def usable(self):
+        return bool(self.client_id)
+
+    # -- demandes de l'interface (rapides, sans bloquer)
+    def idle(self):
+        self._post(("idle",))
+
+    def launching(self, name, version, loader):
+        self._post(("launch", {"name": name, "version": version, "loader": loader}))
+
+    def set_enabled(self, flag):
+        self.enabled = bool(flag)
+        self._post(("sync",))
+
+    def _post(self, cmd):
+        if not self.usable:
+            return
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+        self._q.put(cmd)
+
+    # -- thread unique
+    def _run(self):
+        while True:
+            try:
+                cmd = self._q.get(timeout=self.POLL)
+            except queue.Empty:
+                cmd = None
+            try:
+                if cmd:
+                    self._handle(cmd)
+                self._tick()
+            except Exception:
+                pass
+
+    def _handle(self, cmd):
+        if cmd[0] == "idle":
+            self.mode, self.info = "idle", None
+        elif cmd[0] == "launch":
+            self.mode, self.info, self.t_launch = "launching", cmd[1], time.monotonic()
+        elif cmd[0] == "sync" and not self.enabled:
+            self._clear()
+            return
+        self._push()
+
+    def _tick(self):
+        """Suit le jeu : lancement demandé -> jeu détecté -> jeu fermé."""
+        if not self.enabled:
+            return
+        if self.mode in ("launching", "playing"):
+            running = self.running()
+            if self.mode == "launching" and running:
+                self.mode, self.t_start = "playing", int(time.time())
+            elif self.mode == "launching" and time.monotonic() - self.t_launch > self.LAUNCH_WAIT:
+                self.mode = "idle"
+            elif self.mode == "playing" and not running:
+                self.mode = "idle"
+        self._push()
+
+    def _status(self):
+        info = self.info or {}
+        name = info.get("name") or (f"Minecraft {info['version']}" if info.get("version") else "Minecraft")
+        parts = []
+        if info.get("name") and info.get("version"):
+            parts.append(f"Minecraft {info['version']}")
+        if info.get("loader") not in (None, "", "Vanilla"):
+            parts.append(info["loader"])
+        status = {"large_image": "wecraft", "large_text": f"WeCraft Launcher v{APP_VERSION}",
+                  "buttons": [{"label": "Télécharger WeCraft", "url": f"https://github.com/{GITHUB_REPO}"}]}
+        if self.mode == "playing":
+            status.update(details=f"Joue à {name}", state=" · ".join(parts) or "Minecraft", start=self.t_start)
+        elif self.mode == "launching":
+            status.update(details=f"Prépare {name}", state="Lancement de Minecraft...")
+        else:
+            status.update(details="Dans le launcher", state="Choisit une instance")
+        for k in ("details", "state"):
+            status[k] = status[k][:120]
+        return status
+
+    def _push(self):
+        if not self.enabled:
+            return
+        status = self._status()
+        if self.rpc is not None and status == self._sent:
+            return  # rien de changé : on n'envoie rien (Discord limite la fréquence)
+        if not self._connect():
+            return
+        try:
+            self.rpc.update(**status)
+            self._sent = status
+        except Exception:
+            self._drop()
+
+    def _connect(self):
+        if self.rpc is not None:
+            return True
+        if time.monotonic() < self._retry:
+            return False
+        try:
+            if self.factory:
+                rpc = self.factory(self.client_id)
+            else:
+                import asyncio
+                from pypresence import Presence  # pip install pypresence
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                rpc = Presence(self.client_id, loop=loop)
+            rpc.connect()
+            self.rpc = rpc
+            return True
+        except ImportError:
+            self._retry = float("inf")  # pypresence absent : inutile de réessayer
+        except Exception:  # Discord fermé (ou ID invalide) : on réessaie un peu plus tard
+            self._retry = time.monotonic() + self.RETRY
+        return False
+
+    def _drop(self):
+        try:
+            self.rpc.close()
+        except Exception:
+            pass
+        self.rpc, self._sent, self._retry = None, None, time.monotonic() + self.RETRY
+
+    def _clear(self):
+        if self.rpc is not None:
+            try:
+                self.rpc.clear()
+            except Exception:
+                self._drop()
+        self._sent = None
+
+
 # ------------------------------------------------------------------ interface
 class Launcher(tk.Tk):
     def __init__(self):
         super().__init__()
+        self.withdraw()  # la fenêtre n'apparaît qu'après l'écran de démarrage
         self.title("WeCraft")
         self.geometry("560x860")
         self.minsize(560, 640)
@@ -1117,6 +1554,13 @@ class Launcher(tk.Tk):
 
         Path(MC_DIR).mkdir(parents=True, exist_ok=True)
         self.config_data = self.load_config()
+        self.splash = None
+        if self.config_data.get("splash", True) and "--no-splash" not in sys.argv:
+            try:
+                self.splash = SplashScreen(self, self.show_main)
+                self.update()  # affiche la première image avant le chargement
+            except Exception:
+                self.splash = None
         self.all_versions = []
         self.loader_support = {}  # cache : loader -> versions MC compatibles
         self.loader_version = self.config_data.get("loader_version")  # imposée par l'instance détectée
@@ -1136,14 +1580,70 @@ class Launcher(tk.Tk):
         self.mp_grid = self.mp_pack_grid = self.inst_grid = None  # grilles des modes « Tuiles »
         self.mp_pre, self._pre_gen, self._pre_job, self._http_cache = None, 0, None, {}
         self.mp_edit, self._mp_notice, self._ram_dialog = None, None, None
+        self._launch_info = None  # instance en cours de lancement (pour le statut Discord)
+        self.discord = DiscordPresence(discord_client_id(self.config_data),
+                                       enabled=bool(self.config_data.get("discord", True)))
         view = self.config_data.get("mp_view")
         self.mp_view = tk.StringVar(value=view if view in MP_VIEWS else "list")
         self.set_app_icon()
         self.build_ui()
         self.load_versions()
-        self.check_updates()
         self.refresh_instances(force=True)
         self.after(3000, self.poll_instances)
+        if self.splash:
+            self.splash.start()  # show_main() est appelé à la fin de l'animation
+        else:
+            self.show_main()
+
+    def show_main(self):
+        """Affiche la fenêtre principale (en fondu), puis cherche une mise à jour."""
+        try:
+            self.attributes("-alpha", 0.0)
+        except tk.TclError:
+            pass
+        self.deiconify()
+        self.lift()
+        self.fade_in_main(0.0)
+        self.after(400, self.check_updates)
+        self.discord.idle()  # statut « Dans le launcher » (ignoré sans ID Discord)
+
+    def fade_in_main(self, a):
+        a = min(1.0, a + 0.12)
+        try:
+            self.attributes("-alpha", a)
+        except tk.TclError:
+            return
+        if a < 1.0:
+            self.after(16, lambda: self.fade_in_main(a))
+
+    # ---------- Discord ----------
+    def update_discord_label(self):
+        if self.dc_label is None:
+            return
+        if not pypresence_available():
+            self.dc_label.config(text="DISCORD · INSTALLER PYPRESENCE", fg=EMBER2)
+        else:
+            on = self.discord.enabled
+            self.dc_label.config(text=f"DISCORD : {'ON' if on else 'OFF'}", fg=EMBER2 if on else MUTED)
+
+    def toggle_discord(self):
+        """Active / coupe le statut « Joue à WeCraft » sur Discord (réglage mémorisé)."""
+        if not pypresence_available():
+            messagebox.showinfo("Discord", "Pour afficher WeCraft sur Discord, installez pypresence :\n"
+                                           "    pip install pypresence\npuis relancez WeCraft.")
+            return
+        flag = not self.discord.enabled
+        self.config_data["discord"] = flag
+        self.save_config()
+        self.discord.set_enabled(flag)
+        if flag:
+            self.discord.idle()
+        self.update_discord_label()
+
+    def discord_launching(self):
+        """Le profil est prêt et le launcher officiel s'ouvre : Discord affichera le jeu dès qu'il démarre."""
+        info = self._launch_info or {}
+        self.discord.launching(info.get("name"), info.get("version"), info.get("loader"))
 
     # ---------- Mises à jour ----------
     def check_updates(self, manual=False):
@@ -1249,6 +1749,7 @@ class Launcher(tk.Tk):
                 "instance_name": self.instance_name,
                 "instance_info": self.info_var.get(),
                 "mp_view": self.mp_view.get(),
+                "splash": self.config_data.get("splash", True),
             }
         )
         CONFIG_FILE.write_text(json.dumps(self.config_data), encoding="utf-8")
@@ -1388,12 +1889,18 @@ class Launcher(tk.Tk):
         self.fs_label.bind("<Button-1>", self.toggle_fullscreen)
         self.fs_label.bind("<Enter>", lambda e: self.fs_label.config(fg=EMBER2))
         self.fs_label.bind("<Leave>", lambda e: self.fs_label.config(fg=MUTED))
+        self.dc_label = None  # réglage Discord : visible seulement si un ID d'application est configuré
+        if self.discord.usable:
+            self.dc_label = tk.Label(self, text="", bg=BG, cursor="hand2", font=(self.f_mono, 8))
+            self.dc_label.place(x=14, y=8, anchor="nw")
+            self.dc_label.bind("<Button-1>", lambda e: self.toggle_discord())
+            self.update_discord_label()
 
         # Onglets
         tabs = tk.Frame(self, bg=BG)
         tabs.pack(fill="x", padx=16, pady=(2, 2))
         self.tab_labels = {}
-        for key, text in (("instances", "MES INSTANCES"), ("modpack", "MODPACKS"), ("manual", "MANUEL")):
+        for key, text in (("instances", "MES INSTANCES"), ("wepack", "WEPACK"), ("modpack", "MODPACKS"), ("manual", "MANUEL")):
             lbl = tk.Label(tabs, text=text, bg=BG, fg=MUTED, cursor="hand2",
                            font=(self.f_display, 9, "bold"))
             lbl.pack(side="left", padx=(0, 20))
@@ -1422,6 +1929,7 @@ class Launcher(tk.Tk):
         self.instances_frame = tk.Frame(content, bg=BG)
         self.manual_frame = tk.Frame(content, bg=BG)
         self.modpack_frame = tk.Frame(content, bg=BG)
+        self.wepack_frame = tk.Frame(content, bg=BG)
 
         # ---------- Onglet « Mes instances » ----------
         mono8 = (self.f_mono, 8)
@@ -1499,6 +2007,8 @@ class Launcher(tk.Tk):
         self.next_btn.pack(side="left")
         self.count_label = tk.Label(self.instances_frame, text="", bg=BG, fg=MUTED, font=mono8)
         self.count_label.pack(pady=(6, 0))
+
+        self.build_wepack()
 
         # ---------- Onglet « Manuel » ----------
         m = self.manual_frame
@@ -1634,6 +2144,8 @@ class Launcher(tk.Tk):
         self.bind("<Escape>", self.exit_fullscreen)
         self.bind("<Configure>", self.on_resize)
         self.fs_label.lift()
+        if self.dc_label:
+            self.dc_label.lift()
 
     # ---------- Modpacks (Modrinth) ----------
     def fill_mp_versions(self):
@@ -1679,9 +2191,9 @@ class Launcher(tk.Tk):
             self.mp_pack_canvas.config(height=h)
 
     def on_wheel(self, e):
-        if self.tab not in ("instances", "modpack"):
+        if self.tab not in ("instances", "wepack", "modpack"):
             return
-        canvas = self.cards_canvas if self.tab == "instances" else self.mp_canvas
+        canvas = {"instances": self.cards_canvas, "wepack": self.wp_canvas}.get(self.tab, self.mp_canvas)
         if self.tab == "modpack":
             try:
                 w = self.winfo_containing(e.x_root, e.y_root)
@@ -1973,6 +2485,7 @@ class Launcher(tk.Tk):
             self.mp_canvas.yview_moveto(0)
         self.refresh_mp_pack()
         self.apply_filter(reset_page=False, force=True)
+        self.render_wepack(force=True)
         self.cards_canvas.yview_moveto(0)
 
     def mp_render(self, start=0):
@@ -2556,13 +3069,268 @@ class Launcher(tk.Tk):
         self.show_tab("instances")
         messagebox.showinfo("Modpack modifié", msg)
 
+    # ---------- Onglet « WePack » : modpacks WeCraft + liste de leurs mods ----------
+    WEPACK_MAX = 50  # cartes affichées à la fois (reste fluide avec beaucoup de modpacks)
+
+    def build_wepack(self):
+        f, mono8 = self.wepack_frame, (self.f_mono, 8)
+        top = tk.Frame(f, bg=BG)
+        top.pack(fill="x", padx=14, pady=(4, 0))
+        tk.Label(top, text="RECHERCHE", bg=BG, fg=MUTED, font=mono8).pack(side="left", padx=(0, 8))
+        self.wp_search = tk.StringVar()
+        entry = ttk.Entry(top, textvariable=self.wp_search)
+        entry.pack(side="left", fill="x", expand=True)
+        entry.bind("<Escape>", lambda e: (self.wp_search.set(""), "break")[1])
+        self._wp_job = None
+        self.wp_search.trace_add("write", lambda *_: self._wp_schedule())
+        ttk.Button(top, text="Actualiser",
+                   command=lambda: self.refresh_instances(force=True, rescan=True)).pack(side="left", padx=(8, 0))
+        self.wp_count = tk.Label(f, text="", bg=BG, fg=MUTED, font=mono8, anchor="w")
+        self.wp_count.pack(fill="x", padx=16, pady=(6, 0))
+
+        wrap = tk.Frame(f, bg=BG)
+        wrap.pack(fill="both", expand=True, padx=14, pady=(4, 0))
+        canvas = tk.Canvas(wrap, bg=BG, highlightthickness=0, bd=0)
+        sb = ttk.Scrollbar(wrap, orient="vertical", command=canvas.yview)
+        self.wp_list = tk.Frame(canvas, bg=BG)
+        win_id = canvas.create_window((0, 0), window=self.wp_list, anchor="nw")
+        self.wp_list.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win_id, width=e.width))
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.wp_canvas = canvas
+        self.wp_grid = None  # grille du mode « Tuiles »
+        canvas.bind("<Configure>", lambda e: self.wp_grid and self.wp_grid.layout(e.width), add="+")
+        self._wp_sig = None
+        self.wp_buttons = []  # boutons LANCER des cartes (désactivés pendant un lancement)
+
+    def _wp_schedule(self):
+        if self._wp_job:
+            self.after_cancel(self._wp_job)
+        self._wp_job = self.after(200, lambda: self.render_wepack(force=True))  # attend la fin de la frappe
+
+    def render_wepack(self, force=False):
+        """Liste des modpacks WeCraft (dossier « instances »), dans l'affichage choisi (Tuiles / Tableau / Liste).
+        Ne redessine que si quelque chose a changé."""
+        packs = [i for i in getattr(self, "_instances", []) if i["source"] == "WeCraft"]
+        q = self.wp_search.get().strip().lower()
+        if q:
+            packs = [i for i in packs if q in i["_hay"]]
+        shown = packs[:self.WEPACK_MAX]
+        mode = self.mp_view.get()
+        sig = [(i["display"], i["hidden"], str(i["path"]), i["version"], i["loader"], i["loader_version"])
+               for i in shown] + [len(packs), q, mode]
+        if sig == self._wp_sig and not force:
+            return
+        self._wp_sig = sig
+        for w in self.wp_list.winfo_children():
+            w.destroy()
+        self.wp_buttons, self.wp_grid = [], None
+        n = len(packs)
+        text = f"{n} modpack{'s' if n > 1 else ''} WeCraft"
+        if n > len(shown):
+            text += f"  ·  {len(shown)} premiers affichés, précisez la recherche"
+        self.wp_count.config(text=text)
+        if not packs:
+            msg = ("Aucun modpack trouvé pour cette recherche." if q else
+                   "Aucun modpack WeCraft pour l'instant.\nDéposez un dossier d'instance dans le dossier « instances »,\n"
+                   "ou créez un modpack dans l'onglet MODPACKS.")
+            tk.Label(self.wp_list, text=msg, bg=BG, fg=MUTED, justify="center",
+                     font=(self.f_mono, 9)).pack(pady=40)
+            return
+        if mode == "tiles":
+            host = tk.Frame(self.wp_list, bg=BG)
+            host.pack(fill="x", padx=(0, 6))
+            self.wp_grid = TileGrid(host, 270)
+        elif mode == "table":
+            self.build_wp_header()
+        build = {"list": self.build_wp_card, "tiles": self.build_wp_tile, "table": self.build_wp_row}[mode]
+        for inst in shown:
+            build(inst)
+        if self.wp_grid:
+            self.wp_grid.layout(self.wp_canvas.winfo_width())
+
+    def wp_info(self, inst):
+        """Textes d'un modpack : (titre, ligne de détail, couleur, nombre de mods, texte du nombre de mods)."""
+        title, line, color = self.inst_info(inst)
+        if not inst["version"]:  # pas de bouton RÉGLER dans cet onglet : texte plus court
+            line = "WECRAFT  ·  version inconnue"
+        mods = count_mod_files(inst["path"])
+        return title, line, color, mods, (f"{mods} mod{'s' if mods > 1 else ''}" if mods else "aucun mod trouvé")
+
+    def wp_launch(self, parent, inst, width, height, font_size):
+        btn = GradientButton(parent, text="LANCER" if inst["version"] else "RÉGLER", bg=PANEL, width=width,
+                             height=height, font=(self.f_display, font_size, "bold"),
+                             command=lambda i=inst: self.play_instance(i))
+        btn.config(state="disabled" if self.busy else "normal")
+        self.wp_buttons.append(btn)  # désactivé pendant un lancement
+        return btn
+
+    def wp_setup(self, parent, inst, text="Paramétrage"):
+        """Même menu que le ⚙ de MES INSTANCES."""
+        b = ttk.Button(parent, text=text)
+        b.config(command=lambda i=inst, w=b: self.show_menu(i, w))
+        return b
+
+    # -- Mode « Liste »
+    def build_wp_card(self, inst):
+        title, line, color, mods, mods_text = self.wp_info(inst)
+        card = tk.Frame(self.wp_list, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
+        card.pack(fill="x", padx=(0, 6), pady=4)
+        left = tk.Frame(card, bg=PANEL)
+        left.pack(side="left", fill="x", expand=True, padx=12, pady=10)
+        tk.Label(left, text=title, bg=PANEL, fg=MUTED if inst["hidden"] else FG, anchor="w",
+                 font=(self.f_display, 11, "bold")).pack(fill="x")
+        tk.Label(left, text=line, bg=PANEL, anchor="w", fg=color, font=(self.f_mono, 8)).pack(fill="x")
+        tk.Label(left, text=mods_text, bg=PANEL, anchor="w", fg=EMBER2 if mods else MUTED,
+                 font=(self.f_mono, 8)).pack(fill="x")
+        row = tk.Frame(left, bg=PANEL)  # LANCER · Paramétrage · Liste des mods
+        row.pack(fill="x", pady=(10, 0))
+        self.wp_launch(row, inst, 96, 32, 9).pack(side="left")
+        self.wp_setup(row, inst).pack(side="left", padx=8)
+        ttk.Button(row, text="Liste des mods", command=lambda i=inst: self.show_pack_mods(i)).pack(side="left")
+
+    # -- Mode « Tuiles »
+    def build_wp_tile(self, inst):
+        title, line, color, mods, mods_text = self.wp_info(inst)
+        t = tk.Frame(self.wp_grid.host, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
+        self.wp_grid.add(t)
+        name = tk.Label(t, text=title, bg=PANEL, fg=MUTED if inst["hidden"] else FG, anchor="w", justify="left",
+                        wraplength=220, font=(self.f_display, 10, "bold"))
+        name.pack(fill="x", padx=12, pady=(12, 2))
+        info = tk.Label(t, text=line, bg=PANEL, fg=color, anchor="w", justify="left", wraplength=220,
+                        font=(self.f_mono, 8))
+        info.pack(fill="x", padx=12)
+        tk.Label(t, text=mods_text, bg=PANEL, anchor="w", fg=EMBER2 if mods else MUTED,
+                 font=(self.f_mono, 8)).pack(fill="x", padx=12, pady=(2, 0))
+        self.wp_launch(t, inst, 80, 34, 9).pack(fill="x", padx=12, pady=(10, 6))
+        row = tk.Frame(t, bg=PANEL)
+        row.pack(fill="x", padx=12, pady=(0, 12))
+        self.wp_setup(row, inst).pack(side="left", fill="x", expand=True)
+        ttk.Button(row, text="Liste des mods", command=lambda i=inst: self.show_pack_mods(i)).pack(
+            side="left", fill="x", expand=True, padx=(6, 0))
+        self.wrap_labels(t, [(name, 24), (info, 24)])
+
+    # -- Mode « Tableau »
+    def wp_cols(self, row):
+        for col, (weight, minsize) in enumerate(((1, 0), (0, 110), (0, 56), (0, 92), (0, 46), (0, 60))):
+            row.columnconfigure(col, weight=weight, minsize=minsize)
+
+    def build_wp_header(self):
+        row = tk.Frame(self.wp_list, bg=BG)
+        row.pack(fill="x", padx=(0, 6), pady=(0, 2))
+        self.wp_cols(row)
+        for col, text in ((0, "NOM"), (1, "VERSION · LOADER"), (2, "MODS")):
+            tk.Label(row, text=text, bg=BG, fg=MUTED, anchor="w", font=(self.f_mono, 8)).grid(
+                row=0, column=col, sticky="we", padx=(10 if col == 0 else 4, 4))
+
+    def build_wp_row(self, inst):
+        title, _line, color, mods, _text = self.wp_info(inst)
+        row = tk.Frame(self.wp_list, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
+        row.pack(fill="x", padx=(0, 6), pady=1)
+        self.wp_cols(row)
+        tk.Label(row, text=title, bg=PANEL, fg=MUTED if inst["hidden"] else FG, anchor="w", width=1,
+                 font=(self.f_body, 10, "bold")).grid(row=0, column=0, sticky="we", padx=(10, 4), pady=8)
+        ver = " · ".join(x for x in (inst["version"], inst["loader"]) if x) or "version inconnue"
+        tk.Label(row, text=ver, bg=PANEL, fg=color, anchor="w", font=(self.f_mono, 8)).grid(
+            row=0, column=1, sticky="w", padx=4)
+        tk.Label(row, text=str(mods), bg=PANEL, fg=EMBER2 if mods else MUTED, anchor="w",
+                 font=(self.f_mono, 8)).grid(row=0, column=2, sticky="w", padx=4)
+        self.wp_launch(row, inst, 88, 28, 8).grid(row=0, column=3, sticky="e", padx=4, pady=6)
+        gear = self.wp_setup(row, inst, "⚙")
+        gear.config(width=3)
+        gear.grid(row=0, column=4, sticky="e", padx=2)
+        ttk.Button(row, text="Liste", width=6, command=lambda i=inst: self.show_pack_mods(i)).grid(
+            row=0, column=5, sticky="e", padx=(2, 8))
+
+    def show_pack_mods(self, inst):
+        """Fenêtre avec la liste des mods d'un modpack (recherche + copie dans le presse-papiers)."""
+        win = self.small_dialog("Mods du modpack", 560, 560)
+        win.resizable(True, True)
+        win.minsize(420, 360)
+        tk.Label(win, text="MODS DU MODPACK", bg=BG, fg=FG, font=(self.f_display, 12, "bold")).pack(pady=(14, 2))
+        tk.Label(win, text=inst["display"], bg=BG, fg=BLUE, font=(self.f_mono, 9)).pack()
+        GradientBar(win).pack(fill="x", padx=20, pady=8)
+
+        row = tk.Frame(win, bg=BG)
+        row.pack(fill="x", padx=20)
+        tk.Label(row, text="RECHERCHE", bg=BG, fg=MUTED, font=(self.f_mono, 8)).pack(side="left", padx=(0, 8))
+        q = tk.StringVar()
+        ent = ttk.Entry(row, textvariable=q)
+        ent.pack(side="left", fill="x", expand=True)
+        count = tk.Label(win, text="Lecture des mods...", bg=BG, fg=MUTED, anchor="w", font=(self.f_mono, 8))
+        count.pack(fill="x", padx=22, pady=(6, 2))
+
+        body = tk.Frame(win, bg=BG)
+        body.pack(fill="both", expand=True, padx=20)
+        lb = tk.Listbox(body, bg=PANEL, fg=FG, selectbackground=EMBER1, selectforeground="#1A0A04",
+                        relief="flat", highlightthickness=1, highlightbackground=BORDER, activestyle="none",
+                        font=(self.f_mono, 9))
+        sb = ttk.Scrollbar(body, orient="vertical", command=lb.yview)
+        lb.configure(yscrollcommand=sb.set)
+        lb.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        mods, lines = [], []
+
+        def label(m):
+            s = m["name"] + (f"  ·  {m['version']}" if m["version"] else "")
+            note = pack_note({"kind": "dep" if m["dep"] else "root", "parents": m["parents"]})[0]
+            if note:  # « (dépendance de A et de B) » / « (aussi requis par A) »
+                s += "  " + note
+            if m["disabled"]:
+                s += "  (désactivé)"
+            return s
+
+        def fill(*_):
+            term = q.get().strip().lower()
+            lines[:] = [label(m) for m in mods if term in (m["name"] + " " + m["file"]).lower()]
+            lb.delete(0, "end")
+            for ln in lines:
+                lb.insert("end", ln)
+            total = len(mods)
+            count.config(text=(f"{len(lines)} sur {total} mods" if term else f"{total} mod{'s' if total > 1 else ''}")
+                         if total else "Aucun mod trouvé dans le dossier « mods » de ce modpack.")
+
+        q.trace_add("write", fill)
+        bar = tk.Frame(win, bg=BG)
+        bar.pack(fill="x", padx=20, pady=12)
+
+        def copy():
+            if lines:
+                self.clipboard_clear()
+                self.clipboard_append("\n".join(lines))
+                count.config(text=f"{len(lines)} mods copiés dans le presse-papiers.")
+
+        ttk.Button(bar, text="Copier la liste", command=copy).pack(side="left")
+        ttk.Button(bar, text="Fermer", command=win.destroy).pack(side="right")
+        win.bind("<Escape>", lambda e: win.destroy())
+        ent.focus_set()
+
+        def load():  # lecture des .jar hors de l'interface : la fenêtre ne se fige pas
+            try:
+                found = list_pack_mods(inst["path"], inst["folder"])
+            except Exception:
+                found = []
+
+            def done():
+                if win.winfo_exists():
+                    mods[:] = found
+                    fill()
+            self.after(0, done)
+
+        threading.Thread(target=load, daemon=True).start()
+
     # ---------- Onglets et instances ----------
     def show_tab(self, tab):
         self.tab = tab
-        frames = {"instances": self.instances_frame, "modpack": self.modpack_frame, "manual": self.manual_frame}
+        frames = {"instances": self.instances_frame, "wepack": self.wepack_frame,
+                  "modpack": self.modpack_frame, "manual": self.manual_frame}
         for frame in frames.values():
             frame.pack_forget()
         frames[tab].pack(fill="both", expand=True)
+        if tab == "wepack":
+            self.render_wepack(force=True)
         if tab == "modpack" and not self._mp_auto:  # mods populaires affichés dès la première ouverture
             self._mp_auto = True
             self.after(150, self.mp_search)
@@ -2617,6 +3385,8 @@ class Launcher(tk.Tk):
             if self.ver_var.get() not in ["Toutes"] + versions:
                 self.ver_var.set("Toutes")
             self.apply_filter(reset_page=False, force=force)
+            if self.tab == "wepack":
+                self.render_wepack(force=force)
         if self._queued:
             f, r = self._queued
             self._queued = None
@@ -2932,6 +3702,7 @@ class Launcher(tk.Tk):
             loader_version=inst["loader_version"] if loader != "Vanilla" else None,
             force=False, profile=profile_name_for(inst["display"]),
         )
+        self._launch_info = {"name": inst["display"], "version": inst["version"], "loader": loader}
         self.set_buttons("disabled")
         threading.Thread(target=self.play_worker, kwargs=params, daemon=True).start()
 
@@ -3208,12 +3979,14 @@ class Launcher(tk.Tk):
             force=force,
             profile=profile_name_for(self.instance_name or default_instance_name(self.game_dir())),
         )
+        self._launch_info = {"name": self.instance_name, "version": params["version"],
+                             "loader": params["loader_name"]}
         self.set_buttons("disabled")
         threading.Thread(target=self.play_worker, kwargs=params, daemon=True).start()
 
     def set_buttons(self, state):
         self.busy = state == "disabled"
-        for b in [self.launch_btn] + self.card_buttons:
+        for b in [self.launch_btn] + self.card_buttons + getattr(self, "wp_buttons", []):
             try:
                 b.config(state=state)
             except tk.TclError:
@@ -3305,7 +4078,7 @@ class Launcher(tk.Tk):
             self.set_progress(0)
             self.set_status(f"Profil « {profile} » prêt ({launch_id})")
             if then_launch:
-                self.after(0, lambda: self.start_official(profile))
+                self.after(0, lambda: (self.start_official(profile), self.discord_launching()))
         except Exception as exc:
             err = str(exc)
             self.after(0, lambda: messagebox.showerror("Erreur", err))
